@@ -1,0 +1,17 @@
+{
+  "host": {
+    "address": "127.0.0.1",
+    "port": 43100
+  },
+  "ai": {
+    "provider": "mock",
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434",
+      "model": ""
+    }
+  },
+  "tools": {
+    "grantedPermissions": [],
+    "developmentGrantedPermissions": ["system.info.read"]
+  }
+}

@@ -1,0 +1,149 @@
+<div class="shell">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="George, inicio">
+      <span class="brand-mark" aria-hidden="true">G</span>
+      <span>GEORGE</span>
+    </a>
+    <div class="topbar-status" aria-live="polite">
+      <span class="status-dot" [class.online]="facade.connection() === 'ONLINE'"></span>
+      <span>HOST&nbsp; {{ facade.connection() }}</span>
+    </div>
+    <button class="avatar-button" type="button" aria-label="Perfil">G</button>
+  </header>
+
+  <div class="workspace">
+    <nav class="sidebar" aria-label="Navegación principal">
+      <p class="nav-caption">ESPACIO PERSONAL</p>
+      @for (item of navigation; track item; let first = $first) {
+        <button
+          class="nav-item"
+          [class.active]="first"
+          [disabled]="item !== 'Inicio' && item !== 'Chat'"
+          type="button"
+        >
+          <span class="nav-icon" aria-hidden="true">{{ first ? "◈" : "·" }}</span>
+          {{ item }}
+          @if (!first) {
+            <span class="soon">PRONTO</span>
+          }
+        </button>
+      }
+      <div class="sidebar-bottom">
+        <span class="secure-mark" aria-hidden="true">⌑</span>
+        <span>SESIÓN LOCAL<br /><small>PRIVADA EN ESTE DISPOSITIVO</small></span>
+      </div>
+    </nav>
+
+    <main class="main-panel">
+      <section class="welcome" aria-label="Estado de George">
+        <p class="eyebrow">TU ASISTENTE PERSONAL</p>
+        <div
+          class="orb-wrap"
+          [class.thinking]="facade.agentState() === 'THINKING'"
+          [class.executing]="facade.agentState() === 'EXECUTING'"
+          [class.waiting-approval]="facade.agentState() === 'WAITING_APPROVAL'"
+          [class.error]="facade.agentState() === 'ERROR'"
+        >
+          <div class="orb-halo"></div>
+          <div class="orb">
+            <div class="orb-core"></div>
+            <div class="orb-highlight"></div>
+          </div>
+        </div>
+        <h1>Buenas noches.</h1>
+        <p class="welcome-copy">Estoy aquí para ayudarte a pensar, crear y avanzar.</p>
+        <div class="agent-status" aria-live="polite">
+          <span class="agent-dot"></span>
+          GEORGE <span class="status-divider">/</span> {{ facade.agentState() }}
+        </div>
+        <div class="provider-status" aria-live="polite">
+          AI&nbsp; {{ facade.aiInfo()?.id?.toUpperCase() ?? "UNKNOWN" }}
+          <span class="status-divider">/</span> {{ facade.aiInfo()?.status ?? "UNKNOWN" }}
+          @if (facade.aiInfo()?.model) {
+            <span class="status-divider">·</span> MODEL&nbsp; {{ facade.aiInfo()?.model }}
+          }
+        </div>
+      </section>
+
+      <section class="conversation" aria-label="Conversación" aria-live="polite">
+        @for (message of facade.messages(); track message.id) {
+          <article class="message" [class.user-message]="message.role === 'user'">
+            <span class="message-author">{{ message.role === "user" ? "TÚ" : "GEORGE" }}</span>
+            <p>{{ message.content }}</p>
+          </article>
+        }
+      </section>
+
+      <form class="composer" (submit)="$event.preventDefault(); submit()">
+        <label class="visually-hidden" for="prompt">Escribe un mensaje para George</label>
+        <span class="composer-symbol" aria-hidden="true">›</span>
+        <input
+          id="prompt"
+          [value]="input()"
+          (input)="onInput($event)"
+          [disabled]="facade.connection() !== 'ONLINE'"
+          placeholder="Pregúntame lo que quieras..."
+          autocomplete="off"
+        />
+        <span class="composer-hint">INTRO ↵</span>
+        <button
+          class="send-button"
+          type="submit"
+          [disabled]="!input().trim() || facade.connection() !== 'ONLINE' || facade.busy()"
+          aria-label="Enviar mensaje"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" /></svg>
+        </button>
+      </form>
+      <p class="privacy-note">
+        GEORGE PUEDE COMETER ERRORES · TUS DATOS PERMANECEN EN ESTE DISPOSITIVO
+      </p>
+    </main>
+
+    <aside class="activity-panel" aria-label="Actividad de George">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">EN TIEMPO REAL</p>
+          <h2>Actividad</h2>
+        </div>
+        <span class="live-pill"><i></i> LIVE</span>
+      </div>
+      <div class="activity-list" aria-live="polite">
+        @if (facade.activity().length === 0) {
+          <div class="empty-activity">
+            <span class="empty-line"></span>
+            <p>George está listo.</p>
+            <small>Tu actividad aparecerá aquí.</small>
+          </div>
+        }
+        @for (item of facade.activity(); track item.id) {
+          <article class="activity-item">
+            <span
+              class="activity-marker"
+              [class.failed]="
+                item.event.type === 'request.failed' ||
+                item.event.type === 'tool.failed' ||
+                item.event.type === 'tool.denied'
+              "
+              >{{
+                item.event.type === "request.failed" ||
+                item.event.type === "tool.failed" ||
+                item.event.type === "tool.denied"
+                  ? "!"
+                  : "✓"
+              }}</span
+            >
+            <div>
+              <p>{{ item.label }}</p>
+              <small>{{ item.event.occurredAt | date: "HH:mm:ss" }}</small>
+            </div>
+          </article>
+        }
+      </div>
+      <div class="activity-footer">
+        <span class="footer-pulse"></span> EVENTOS DEL AGENTE
+        <span>{{ facade.activity().length }}</span>
+      </div>
+    </aside>
+  </div>
+</div>

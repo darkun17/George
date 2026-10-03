@@ -1,0 +1,10 @@
+{
+  "assistant": {
+    "name": "Assistant",
+    "language": "en"
+  },
+  "user": {},
+  "ai": {
+    "provider": "mock"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@george/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean && rimraf dist",
+    "dev": "pnpm -r --filter @george/policy --filter @george/tools-sdk --filter @george/tools-core build && pnpm --filter @george/core build && tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -b --pretty"
+  },
+  "dependencies": {
+    "@fastify/static": "9.0.0",
+    "@george/ai": "workspace:*",
+    "@george/config": "workspace:*",
+    "@george/core": "workspace:*",
+    "@george/protocol": "workspace:*",
+    "@george/policy": "workspace:*",
+    "@george/tools-core": "workspace:*",
+    "fastify": "5.12.5"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15",
+    "rimraf": "6.0.1"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@george/policy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean && rimraf dist",
+    "typecheck": "tsc -b --pretty"
+  },
+  "dependencies": {
+    "@george/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "rimraf": "6.0.1",
+    "typescript": "5.9.3"
+  }
+}
