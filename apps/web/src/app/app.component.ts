@@ -1,8 +1,24 @@
-import { Component, inject, signal } from "@angular/core";
-import type { OnDestroy, OnInit } from "@angular/core";
+import { Component, ViewChild, effect, inject, signal } from "@angular/core";
+import type { ElementRef, OnDestroy, OnInit } from "@angular/core";
 import { DatePipe } from "@angular/common";
 import { AgentFacade, isApprovalActionDisabled } from "./agent-facade.service.js";
 import type { ApprovalRequest } from "@george/protocol";
+
+/** Pixels of slack from the bottom of the chat history still counted as "at the bottom". */
+export const AUTO_SCROLL_NEAR_BOTTOM_PX = 120;
+
+/**
+ * Decides whether the chat history should auto-scroll to the newest message.
+ * Pure so it stays testable without rendering a real scrollable DOM node.
+ */
+export function shouldAutoScroll(
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number
+): boolean {
+  const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+  return distanceFromBottom <= AUTO_SCROLL_NEAR_BOTTOM_PX;
+}
 
 @Component({
   selector: "george-root",
@@ -14,6 +30,21 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly facade = inject(AgentFacade);
   readonly input = signal("");
   readonly navigation = ["Inicio", "Chat", "Proyectos", "Memoria", "Actividad", "Ajustes"];
+
+  @ViewChild("conversationEl") private conversationRef?: ElementRef<HTMLElement>;
+  #lastMessageCount = 0;
+
+  constructor() {
+    effect(() => {
+      const count = this.facade.messages().length;
+      if (count === this.#lastMessageCount) return;
+      this.#lastMessageCount = count;
+      const el = this.conversationRef?.nativeElement;
+      if (el && shouldAutoScroll(el.scrollTop, el.scrollHeight, el.clientHeight)) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+  }
 
   ngOnInit(): void {
     void this.facade.connect();

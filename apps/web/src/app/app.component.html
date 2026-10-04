@@ -65,7 +65,7 @@
         </div>
       </section>
 
-      <section class="conversation" aria-label="Conversación" aria-live="polite">
+      <section class="conversation" #conversationEl aria-label="Conversación" aria-live="polite">
         @for (message of facade.messages(); track message.id) {
           <article class="message" [class.user-message]="message.role === 'user'">
             <span class="message-author">{{ message.role === "user" ? "TÚ" : "GEORGE" }}</span>
