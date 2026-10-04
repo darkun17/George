@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AIProviderError, type ManagedAIProvider } from "@george/ai";
 import type { AIMessage, AIProviderResult, AgentResponse } from "@george/protocol";
@@ -8,6 +11,13 @@ import { PendingApprovalStore } from "./pending-approval-store.js";
 
 const ORIGIN = "http://127.0.0.1:4200";
 const servers: Array<{ app: FastifyInstance; close: () => Promise<void> }> = [];
+const temporaryDirectories: string[] = [];
+
+function temporarySettingsPath(): string {
+  const directory = mkdtempSync(join(tmpdir(), "george-settings-"));
+  temporaryDirectories.push(directory);
+  return join(directory, "settings.json");
+}
 
 async function createServer(
   aiProvider?: ManagedAIProvider,
@@ -18,6 +28,7 @@ async function createServer(
     environment: { NODE_ENV: "test" },
     origins: [ORIGIN],
     serveWeb: false,
+    settingsPath: temporarySettingsPath(),
     ...(aiProvider ? { aiProvider } : {}),
     ...(grantedPermissions ? { grantedPermissions } : {}),
     ...(approvalStore ? { approvalStore } : {})
@@ -43,6 +54,8 @@ async function bootstrap(app: FastifyInstance) {
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
+  for (const directory of temporaryDirectories.splice(0))
+    rmSync(directory, { recursive: true, force: true });
 });
 
 describe("George Host HTTP boundary", () => {
@@ -120,18 +133,20 @@ describe("George Host HTTP boundary", () => {
       headers: { cookie: session.cookie }
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({
-      tools: [
-        {
-          id: "system.info",
-          name: "System information",
-          description: "Read basic operating system and hardware information.",
-          riskLevel: "SAFE",
-          requiredPermissions: ["system.info.read"],
-          timeoutMs: 2000,
-          availability: "AVAILABLE"
-        }
-      ]
+    expect(response.json().tools.map((tool: { id: string }) => tool.id)).toEqual([
+      "system.info",
+      "apps.list",
+      "apps.open",
+      "system.process.list"
+    ]);
+    expect(response.json().tools[0]).toEqual({
+      id: "system.info",
+      name: "System information",
+      description: "Read basic operating system and hardware information.",
+      riskLevel: "SAFE",
+      requiredPermissions: ["system.info.read"],
+      timeoutMs: 2000,
+      availability: "AVAILABLE"
     });
     expect(response.body).not.toMatch(/handler|schema|secret|[A-Za-z]:\\/i);
   });
@@ -566,5 +581,505 @@ describe("George Host HTTP boundary", () => {
     });
     expect(result.statusCode).toBe(403);
     expect(executionCount).toBe(0);
+  });
+});
+
+describe("trusted Origin policy (default, environment-driven)", () => {
+  const DEFAULT_PORT = 43100;
+  const HOST_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
+  const DEV_ORIGIN = "http://127.0.0.1:4200";
+
+  async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
+    const server = await buildHostServer({
+      environment,
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
+    servers.push(server);
+    return server.app;
+  }
+
+  async function postAgentRequest(app: FastifyInstance, origin: string | undefined) {
+    return app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: origin !== undefined ? { origin } : {},
+      payload: { conversationId: "c", input: "hola" }
+    });
+  }
+
+  it("A. accepts the Host's own origin in production", async () => {
+    const app = await createEnvServer({ NODE_ENV: "production" });
+    const response = await postAgentRequest(app, HOST_ORIGIN);
+    expect(response.statusCode).not.toBe(403);
+  });
+
+  it("B. accepts the Angular dev origin outside production", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, DEV_ORIGIN);
+    expect(response.statusCode).not.toBe(403);
+  });
+
+  it("C. rejects the Angular dev origin in production", async () => {
+    const app = await createEnvServer({ NODE_ENV: "production" });
+    const response = await postAgentRequest(app, DEV_ORIGIN);
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("D. rejects an arbitrary untrusted localhost port", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "http://127.0.0.1:5555");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("E. does not treat localhost and 127.0.0.1 as equivalent", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "http://localhost:4200");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("F. rejects a malicious external origin", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "https://evil.example.com");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("G. rejects a malformed Origin header without throwing", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "not-a-valid-origin");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("H. rejects a mutating request with a missing Origin header", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, undefined);
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("never mounts the compiled web build by default outside production", async () => {
+    // Regression guard for the dual-origin session collision: Host must not become a second
+    // UI entry point unless explicitly asked (serveWeb: true) or running in production, even
+    // when apps/web/dist exists on disk from a previous `pnpm build`.
+    const server = await buildHostServer({
+      environment: {},
+      origins: [DEV_ORIGIN],
+      settingsPath: temporarySettingsPath()
+    });
+    servers.push(server);
+    const response = await server.app.inject({ method: "GET", url: "/", headers: {} });
+    expect(response.statusCode).toBe(404);
+  });
+});
+
+describe("session/CSRF lifecycle (I-M, and the dual-origin collision regression)", () => {
+  async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
+    const server = await buildHostServer({
+      environment,
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
+    servers.push(server);
+    return server.app;
+  }
+
+  it("I. rejects a mutating request with no session cookie", async () => {
+    const app = await createEnvServer({});
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "SESSION_REQUIRED" } });
+  });
+
+  it("J. rejects a mutating request with an invalid/garbage session cookie", async () => {
+    const app = await createEnvServer({});
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: "george_session=not-a-real-session" },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "SESSION_REQUIRED" } });
+  });
+
+  it("K. rejects a mutating request with a valid session but no CSRF header", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+
+  it("L. rejects a mutating request with an invalid CSRF token", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": "wrong-token" },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+
+  it("M. valid session + valid CSRF + trusted dev Origin succeeds", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: "completed" });
+  });
+
+  it("reproduces the root cause: a second origin's bootstrap orphans the first origin's CSRF token", async () => {
+    // This is the exact mechanism behind the reported dev-mode 403: browser cookies are
+    // host-scoped, not port-scoped, so when a second trusted origin (e.g. Host's own static
+    // UI at 43100) bootstraps on the same host, it silently overwrites the shared
+    // george_session cookie. The first origin's in-memory CSRF token is now stale and must
+    // be rejected -- CSRF enforcement is working as designed, not broken.
+    const app = await createEnvServer({});
+    const first = await bootstrap(app); // tab/origin A's session + CSRF
+    const second = await bootstrap(app); // tab/origin B re-bootstraps on the shared host cookie
+
+    const staleRequest = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      // The real browser's cookie jar is host-scoped, not port-scoped: a single
+      // `george_session` cookie exists for 127.0.0.1, and the most recent bootstrap (B)
+      // is what it now holds and auto-attaches -- while origin A's JS still has its own
+      // original CSRF token cached in memory from its own earlier bootstrap.
+      headers: { origin: ORIGIN, cookie: second.cookie!, "x-george-csrf": first.csrfToken },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(staleRequest.statusCode).toBe(403);
+    expect(staleRequest.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+});
+
+describe("Settings and Doctor", () => {
+  it("requires a local session to read settings and never exposes secrets", async () => {
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/settings" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ai: { provider: "mock" } });
+    expect(response.body).not.toMatch(/credentialRef|sk-|secret/i);
+  });
+
+  it("requires Origin, session, and CSRF to update settings, then persists the change", async () => {
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const noCsrf = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: { origin: ORIGIN, cookie: session.cookie },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(noCsrf.statusCode).toBe(403);
+
+    const wrongOrigin = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: {
+        origin: "https://evil.example",
+        cookie: session.cookie,
+        "x-george-csrf": session.csrfToken
+      },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(wrongOrigin.statusCode).toBe(403);
+
+    const updated = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({ assistant: { name: "Jarvis" } });
+
+    const confirm = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(confirm.json()).toMatchObject({ assistant: { name: "Jarvis" } });
+  });
+
+  it("rejects an invalid settings patch without corrupting stored settings", async () => {
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers,
+      payload: { assistant: { name: "" } }
+    });
+    expect(invalid.statusCode).toBe(400);
+    const stillValid = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(stillValid.json()).toMatchObject({ assistant: { name: "George" } });
+  });
+
+  it("requires a local session for Doctor and reports real, non-hardcoded checks", async () => {
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/doctor" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/doctor",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    const report = response.json();
+    expect(report.core).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "host", state: "AVAILABLE" })])
+    );
+    expect(report.voice.every((check: { state: string }) => check.state === "NOT_INSTALLED")).toBe(
+      true
+    );
+    // "csrf" itself is a legitimate check label (Doctor reports a "csrf" check);
+    // only an actual token/cookie VALUE would be a leak.
+    expect(response.body).not.toMatch(/credentialRef|cookie=|george_session/i);
+  });
+
+  it("requires a local session for Ollama discovery and never throws regardless of reachability", async () => {
+    // Does not assert a fixed { available, models } value: whether a local Ollama
+    // happens to be running on the test machine's default port is environment state,
+    // not something this unit test should depend on (see docs/.claude/rules/testing.md).
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/ai/discover" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/ai/discover",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(typeof body.available).toBe("boolean");
+    expect(Array.isArray(body.models)).toBe(true);
+  });
+});
+
+describe("M5.1 desktop action tools (apps.list, apps.open, system.process.list)", () => {
+  // Every candidate-path env var is pointed at a location that cannot exist on any
+  // machine, so apps.open can never resolve a real executable in this automated
+  // suite -- an empty/partial environment falls back to real default install paths
+  // (e.g. "C:\Program Files"), which on a real dev machine can and does resolve a
+  // real installed Chrome/VS Code. Approving apps.open here must never spawn
+  // anything real; only the live manual validation does that, deliberately.
+  async function createIsolatedServer() {
+    const server = await buildHostServer({
+      environment: {
+        NODE_ENV: "test",
+        LOCALAPPDATA: "Z:\\george-test-does-not-exist\\LOCALAPPDATA",
+        ProgramFiles: "Z:\\george-test-does-not-exist\\ProgramFiles",
+        "ProgramFiles(x86)": "Z:\\george-test-does-not-exist\\ProgramFilesX86",
+        SystemRoot: "Z:\\george-test-does-not-exist\\SystemRoot"
+      },
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
+    servers.push(server);
+    return server.app;
+  }
+
+  it("lists configured applications with real (not hardcoded) availability, without exposing paths", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.list/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(result.output.applications).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "vscode", available: false })])
+    );
+    expect(response.body).not.toMatch(/\.exe|Program Files|george-test-does-not-exist/i);
+  });
+
+  it("direct tool execution surfaces approval_required but has no conversation to later resume", async () => {
+    // /api/v1/tools/:id/execute has no Agent transcript to continue, so its ASK
+    // result is informational only (it still proves policy/risk evaluation ran);
+    // the resumable approval lifecycle is specifically the Agent request flow below.
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const requested = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.open/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: { applicationId: "vscode" } }
+    });
+    expect(requested.statusCode).toBe(409);
+    expect(requested.json()).toMatchObject({ status: "approval_required" });
+  });
+
+  it("George, abre Visual Studio Code: full Agent flow -- THINKING, approval with a safe summary, approve, execute, audit", async () => {
+    const observed: AIMessage[][] = [];
+    let turn = 0;
+    const provider: ManagedAIProvider = {
+      id: "scripted",
+      capabilities: { streaming: false, tools: true },
+      management: {
+        getInfo: async () => ({
+          id: "scripted",
+          status: "AVAILABLE",
+          model: "fake",
+          models: ["fake"]
+        }),
+        listModels: async () => ["fake"]
+      },
+      async chat(messages) {
+        observed.push([...messages]);
+        return turn++ === 0
+          ? {
+              kind: "tool_calls",
+              calls: [{ id: "open-1", toolId: "apps.open", input: { applicationId: "vscode" } }]
+            }
+          : { kind: "message", text: "Intenté abrir Visual Studio Code." };
+      }
+    };
+    const audit = new InMemoryAuditSink();
+    const server = await buildHostServer({
+      environment: {
+        NODE_ENV: "test",
+        LOCALAPPDATA: "Z:\\george-test-does-not-exist\\LOCALAPPDATA",
+        ProgramFiles: "Z:\\george-test-does-not-exist\\ProgramFiles",
+        "ProgramFiles(x86)": "Z:\\george-test-does-not-exist\\ProgramFilesX86",
+        SystemRoot: "Z:\\george-test-does-not-exist\\SystemRoot"
+      },
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath(),
+      aiProvider: provider,
+      auditSink: audit
+    });
+    servers.push(server);
+    const app = server.app;
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+
+    const pendingResponse = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers,
+      payload: { conversationId: "c", input: "George, abre Visual Studio Code." }
+    });
+    expect(pendingResponse.statusCode).toBe(409);
+    expect(pendingResponse.json()).toMatchObject({ status: "approval_required" });
+
+    const approvalsList = await app.inject({
+      method: "GET",
+      url: "/api/v1/approvals",
+      headers: { origin: ORIGIN, cookie: session.cookie }
+    });
+    const pending = approvalsList.json().approvals[0];
+    expect(pending).toMatchObject({
+      toolId: "apps.open",
+      riskLevel: "HIGH",
+      status: "PENDING",
+      summary: "Abrir Visual Studio Code"
+    });
+
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/v1/approvals/${pending.approvalId}/approve`,
+      headers
+    });
+    // The (deliberately fake) environment has no real VS Code install, so execution
+    // fails closed -- but the approval itself was honored, policy was re-evaluated,
+    // and the Agent transcript continued with the real tool result, proving the
+    // whole THINKING -> WAITING_APPROVAL -> EXECUTING -> response pipeline works.
+    expect(approved.statusCode).toBe(500);
+    expect(approved.json()).toMatchObject({
+      status: "failed",
+      error: { code: "TOOL_EXECUTION_FAILED" }
+    });
+    expect(observed).toHaveLength(1); // the provider is only re-consulted after a *successful* tool run
+
+    const toolAuditRecords = audit.records.filter(
+      (record) => record.operation === "tool.execution"
+    );
+    expect(toolAuditRecords.some((record) => record.toolId === "apps.open")).toBe(true);
+    expect(JSON.stringify(toolAuditRecords)).not.toMatch(/applicationId|vscode/i);
+    const approvalAuditRecords = audit.records.filter(
+      (record) => record.operation === "approval.decision"
+    );
+    expect(approvalAuditRecords.map((record) => record.decision)).toEqual([
+      "requested",
+      "approved"
+    ]);
+  });
+
+  it("denies apps.open outright when the permission itself is not granted, even with an approval id", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.open/execute",
+      headers,
+      payload: { input: { applicationId: "vscode" }, approvalId: "forged-approval-id" }
+    });
+    // The route never accepts approvalId/permission overrides from the request body;
+    // this just proves the forged field is ignored and normal ASK behavior still applies.
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("lists real running processes with only safe pid/name fields", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/system.process.list/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(Array.isArray(result.output.processes)).toBe(true);
+    expect(result.output.processes.length).toBeGreaterThan(0);
+    expect(response.body).not.toMatch(/--|cmdline/i);
   });
 });

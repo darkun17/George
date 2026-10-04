@@ -45,6 +45,11 @@ export class SessionStore {
     return session;
   }
 
+  count(now = Date.now()): number {
+    this.#prune(now);
+    return this.#sessions.size;
+  }
+
   validateCsrf(session: LocalSession, candidate: string | undefined): boolean {
     if (!candidate) return false;
     const expected = Buffer.from(session.csrfToken, "utf8");

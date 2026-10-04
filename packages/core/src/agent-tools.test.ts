@@ -32,6 +32,7 @@ function createTools(
     output?: Partial<SystemInfo>;
     riskLevel?: RiskLevel;
     onRun?: () => void;
+    describeForApproval?: (input: unknown) => string;
   } = {}
 ) {
   const registry = new InMemoryToolRegistry();
@@ -47,6 +48,7 @@ function createTools(
   registry.register({
     ...systemInfoTool,
     ...(options.riskLevel ? { riskLevel: options.riskLevel } : {}),
+    ...(options.describeForApproval ? { describeForApproval: options.describeForApproval } : {}),
     handler
   });
   const policyEngine: ToolRuntimeOptions["policyEngine"] = {
@@ -228,6 +230,39 @@ describe("AgentRuntime tool orchestration", () => {
         content: expect.any(String)
       }
     ]);
+  });
+
+  it("threads a tool's safe approval summary through to the approval coordinator", async () => {
+    const tools = createTools({
+      riskLevel: "HIGH",
+      describeForApproval: () => "Abrir vscode"
+    });
+    const summaries: (string | undefined)[] = [];
+    const coordinator: AgentRuntimeOptions["approvalCoordinator"] = {
+      create(input) {
+        summaries.push(input.summary);
+        return {
+          approvalId: "approval-id",
+          requestId: input.requestId,
+          conversationId: input.conversationId,
+          toolCallId: input.toolCallId,
+          toolId: input.toolId,
+          riskLevel: input.riskLevel,
+          createdAt: "2026-10-03T12:00:00.000Z",
+          expiresAt: "2026-10-03T12:05:00.000Z",
+          status: "PENDING",
+          ...(input.summary ? { summary: input.summary } : {})
+        };
+      }
+    };
+    const agent = createAgent(scripted([toolCall("call")]), {
+      toolRuntime: tools.toolRuntime,
+      grants: ["system.info.read"],
+      approvalCoordinator: coordinator
+    });
+    const pending = await agent.runtime.run(request);
+    expect(pending).toMatchObject({ status: "approval_required" });
+    expect(summaries).toEqual(["Abrir vscode"]);
   });
 
   it("re-resolves permissions and does not execute when the grant disappears before approval", async () => {

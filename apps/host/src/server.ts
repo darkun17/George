@@ -4,17 +4,36 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import type { ServerResponse } from "node:http";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentRuntime, InMemoryAuditSink } from "@george/core";
 import type { AuditSink } from "@george/protocol";
-import { createAIProvider, type ManagedAIProvider } from "@george/ai";
-import { loadAIConfiguration, loadHostConfiguration, PermissionResolver } from "@george/config";
+import { createAIProvider, OllamaProvider, type ManagedAIProvider } from "@george/ai";
+import {
+  aiConfigurationSchema,
+  loadAIConfiguration,
+  loadDefaultAssistantProfile,
+  loadHostConfiguration,
+  PermissionResolver,
+  type AIConfiguration
+} from "@george/config";
 import { DefaultPolicyEngine } from "@george/policy";
-import { InMemoryToolRegistry, ToolRuntime, systemInfoTool } from "@george/tools-core";
+import {
+  ApplicationRegistry,
+  InMemoryToolRegistry,
+  ToolRuntime,
+  createAppsListTool,
+  createAppsOpenTool,
+  systemInfoTool,
+  systemProcessListTool
+} from "@george/tools-core";
 import { SessionStore, readSessionCookie } from "./session-store.js";
 import { SseAgentEventSink } from "./sse-event-sink.js";
 import { PendingApprovalStore } from "./pending-approval-store.js";
 import { getAuditDatabasePath, SqliteAuditSink } from "./sqlite-audit-sink.js";
+import { getAppDataDir } from "./app-data.js";
+import { SettingsStore, type SettingsPatch } from "./settings-store.js";
+import { buildDoctorReport } from "./doctor.js";
 
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
 const MAX_AGENT_INPUT_LENGTH = 4000;
@@ -30,6 +49,31 @@ export interface HostServerOptions {
   readonly auditSink?: AuditSink;
   readonly auditDatabasePath?: string;
   readonly approvalStore?: PendingApprovalStore;
+  readonly settingsStore?: SettingsStore;
+  readonly settingsPath?: string;
+}
+
+/**
+ * Builds the effective AI provider configuration: persisted settings (if any)
+ * take priority over environment variables, but fall back to the env-derived
+ * configuration whenever the persisted selection is incomplete or invalid --
+ * a stale settings file must never stop Host from starting.
+ */
+function resolveEffectiveAIConfig(
+  envConfig: AIConfiguration,
+  settingsAi: {
+    readonly provider: "mock" | "ollama";
+    readonly ollama?: { readonly model: string } | undefined;
+  }
+): AIConfiguration {
+  if (settingsAi.provider === "mock") return { provider: "mock" };
+  const baseUrl = envConfig.provider === "ollama" ? envConfig.ollama.baseUrl : undefined;
+  const candidate = {
+    provider: "ollama" as const,
+    ollama: { model: settingsAi.ollama?.model ?? "", ...(baseUrl ? { baseUrl } : {}) }
+  };
+  const parsed = aiConfigurationSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : envConfig;
 }
 
 function expectedOrigins(
@@ -57,6 +101,22 @@ function expectedOrigins(
   return origins;
 }
 
+/**
+ * Logs the safe rejection reason for a protected request without ever logging the
+ * cookie, session token, CSRF token, or any header/body value that produced the
+ * rejection. The HTTP response body already carries the same safe code to the caller.
+ */
+function rejectRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  statusCode: number,
+  code: "ORIGIN_REJECTED" | "SESSION_REQUIRED" | "CSRF_REJECTED",
+  message: string
+): FastifyReply {
+  request.log.warn({ requestId: request.id, code }, "George rejected a protected request");
+  return reply.code(statusCode).send({ error: { code, message } });
+}
+
 function setSecurityHeaders(reply: { header: (name: string, value: string) => unknown }): void {
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "no-referrer");
@@ -75,7 +135,15 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 }> {
   const environment = options.environment ?? process.env;
   const config = loadHostConfiguration(environment);
-  const aiConfig = loadAIConfiguration(environment);
+  const envAiConfig = loadAIConfiguration(environment);
+  const settingsStore =
+    options.settingsStore ??
+    new SettingsStore(
+      options.settingsPath ?? join(getAppDataDir(environment), "settings.json"),
+      loadDefaultAssistantProfile(environment)
+    );
+  const settings = settingsStore.get();
+  const aiConfig = resolveEffectiveAIConfig(envAiConfig, settings.ai);
   const aiProvider = options.aiProvider ?? createAIProvider(aiConfig);
   const origins = new Set(options.origins ?? expectedOrigins(config.host.port, environment));
   for (const origin of origins) {
@@ -102,8 +170,12 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
       ? new InMemoryAuditSink()
       : new SqliteAuditSink(options.auditDatabasePath ?? getAuditDatabasePath(environment)));
   const approvalStore = options.approvalStore ?? new PendingApprovalStore(auditSink);
+  const applicationRegistry = new ApplicationRegistry(environment);
   const toolRegistry = new InMemoryToolRegistry();
   toolRegistry.register(systemInfoTool);
+  toolRegistry.register(createAppsListTool(applicationRegistry));
+  toolRegistry.register(createAppsOpenTool(applicationRegistry));
+  toolRegistry.register(systemProcessListTool);
   const toolRuntime = new ToolRuntime({
     registry: toolRegistry,
     policyEngine: new DefaultPolicyEngine(),
@@ -194,9 +266,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   app.get("/api/v1/ai/status", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return aiProvider.management.getInfo();
@@ -205,9 +275,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   app.get("/api/v1/ai/models", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     try {
@@ -222,12 +290,93 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     }
   });
 
+  app.get("/api/v1/ai/discover", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    const baseUrl =
+      envAiConfig.provider === "ollama" ? envAiConfig.ollama.baseUrl : "http://127.0.0.1:11434";
+    try {
+      const models = await new OllamaProvider({ baseUrl, model: "discovery-only" }).listModels();
+      return { available: true, models };
+    } catch {
+      return { available: false, models: [] };
+    }
+  });
+
+  app.get("/api/v1/settings", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    return settingsStore.get();
+  });
+
+  app.patch<{ Body: unknown }>("/api/v1/settings", async (request, reply) => {
+    if (!validateOrigin(request.headers.origin)) {
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+    }
+    const cookieHeader = request.headers.cookie;
+    const session = getSession(
+      Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+    );
+    if (!session) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    const csrfHeader = request.headers["x-george-csrf"];
+    if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
+    }
+    reply.header("Cache-Control", "no-store");
+    try {
+      const updated = settingsStore.update((request.body ?? {}) as SettingsPatch);
+      return updated;
+    } catch {
+      return reply.code(400).send({
+        error: { code: "INVALID_SETTINGS", message: "La configuración enviada no es válida." }
+      });
+    }
+  });
+
+  app.get("/api/v1/doctor", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    return buildDoctorReport({
+      aiProvider,
+      settings: settingsStore.get(),
+      sessionCount: () => sessions.count(),
+      pendingApprovalCount: () => approvalStore.list().length,
+      auditHealthy: () => {
+        if (!(auditSink instanceof SqliteAuditSink)) return true;
+        try {
+          auditSink.recent(1);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      trustedOriginCount: () => origins.size,
+      appVersion: "0.1.0",
+      dataDirectory: getAppDataDir(environment)
+    });
+  });
+
   app.get("/api/v1/tools", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return { tools: toolRegistry.listMetadata() };
@@ -242,15 +391,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookie = request.headers.cookie;
     if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return { approvals: approvalStore.list() };
@@ -265,15 +410,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookie = request.headers.cookie;
     if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     const query =
       request.query && typeof request.query === "object"
@@ -291,20 +432,20 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     decision: "approve" | "deny"
   ) => {
     if (!validateOrigin(request.headers.origin))
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     const cookie = request.headers.cookie;
     const session = getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie);
     if (!session)
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     const csrf = request.headers["x-george-csrf"];
     if (!sessions.validateCsrf(session, Array.isArray(csrf) ? csrf[0] : csrf))
-      return reply.code(403).send({
-        error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-      });
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
     reply.header("Cache-Control", "no-store");
     const result =
       decision === "approve"
@@ -352,24 +493,24 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     Body: { input?: unknown; conversationId?: unknown };
   }>("/api/v1/tools/:id/execute", async (request, reply) => {
     if (!validateOrigin(request.headers.origin)) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookieHeader = request.headers.cookie;
     const session = getSession(
       Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
     );
     if (!session) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     const csrfHeader = request.headers["x-george-csrf"];
     if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
-      return reply.code(403).send({
-        error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-      });
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
     }
     const body = request.body;
     const validOptionalId = (value: unknown): value is string | undefined =>
@@ -423,9 +564,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 
   app.post("/api/v1/session/bootstrap", async (request, reply) => {
     if (!validateOrigin(request.headers.origin)) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const session = sessions.create(request.ip);
     if (!session) {
@@ -445,24 +584,24 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     "/api/v1/agent/requests",
     async (request, reply) => {
       if (!validateOrigin(request.headers.origin)) {
-        return reply
-          .code(403)
-          .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+        return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
       }
       const cookieHeader = request.headers.cookie;
       const session = getSession(
         Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
       );
       if (!session) {
-        return reply
-          .code(401)
-          .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+        return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
       }
       const csrfHeader = request.headers["x-george-csrf"];
       if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
-        return reply.code(403).send({
-          error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-        });
+        return rejectRequest(
+          request,
+          reply,
+          403,
+          "CSRF_REJECTED",
+          "La solicitud no superó la validación CSRF."
+        );
       }
       const body = request.body;
       if (
@@ -528,15 +667,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     if (sseResponses.size >= 8) {
       return reply.code(429).send({
@@ -573,7 +708,13 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 
   const webRoot = options.webRoot ?? new URL("../../web/dist/browser/", import.meta.url);
   const resolvedWebRoot = webRoot instanceof URL ? fileURLToPath(webRoot) : webRoot;
-  if (options.serveWeb !== false && existsSync(resolvedWebRoot)) {
+  // A compiled apps/web/dist left over from `pnpm build` must not turn Host into a second,
+  // concurrently-reachable UI origin while the Angular dev server is also running: browser
+  // cookies are host-scoped, not port-scoped, so bootstrapping a session on each origin would
+  // silently overwrite the other's session and orphan its cached CSRF token (CSRF_REJECTED).
+  // Outside production this static mount is opt-in only.
+  const serveWeb = options.serveWeb ?? environment["NODE_ENV"] === "production";
+  if (serveWeb && existsSync(resolvedWebRoot)) {
     await app.register(fastifyStatic, {
       root: resolvedWebRoot,
       prefix: "/",

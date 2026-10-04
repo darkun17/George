@@ -62,7 +62,15 @@ describe("loadHostConfiguration", () => {
   it("defaults to loopback and the configured local port", () => {
     expect(loadHostConfiguration({})).toEqual({
       host: { address: "127.0.0.1", port: 43100 },
-      tools: { grantedPermissions: ["system.info.read"], deniedPermissions: [] }
+      tools: {
+        grantedPermissions: [
+          "system.info.read",
+          "apps.list.read",
+          "apps.open.execute",
+          "system.process.read"
+        ],
+        deniedPermissions: []
+      }
     });
   });
 
@@ -96,9 +104,12 @@ describe("loadHostConfiguration", () => {
     ).toThrow();
   });
 
-  it("grants the development diagnostic permission explicitly and defaults production to none", () => {
+  it("grants the development diagnostic permissions explicitly and defaults production to none", () => {
     expect(loadHostConfiguration({ NODE_ENV: "test" }).tools.grantedPermissions).toEqual([
-      "system.info.read"
+      "system.info.read",
+      "apps.list.read",
+      "apps.open.execute",
+      "system.process.read"
     ]);
     expect(loadHostConfiguration({ NODE_ENV: "production" }).tools.grantedPermissions).toEqual([]);
   });

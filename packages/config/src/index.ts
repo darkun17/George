@@ -10,7 +10,8 @@ export const assistantProfileSchema = z.object({
   user: z.object({ displayName: z.string().trim().min(1).optional() }),
   ai: z.object({
     provider: z.enum(["mock", "ollama"]),
-    credentialRef: z.string().trim().min(1).optional()
+    credentialRef: z.string().trim().min(1).optional(),
+    ollama: z.object({ model: z.string().trim().min(1) }).optional()
   })
 });
 
@@ -144,6 +145,21 @@ export function loadHostConfiguration(
     );
   }
   return result.data;
+}
+
+/** The env/defaults-derived assistant profile, used to seed a fresh SettingsStore. */
+export function loadDefaultAssistantProfile(
+  environment: Readonly<Record<string, string | undefined>>
+): AssistantProfileConfig {
+  const ai = loadAIConfiguration(environment);
+  return parseAssistantProfile({
+    assistant: { name: defaults.assistant.name, language: defaults.assistant.language },
+    user: {},
+    ai:
+      ai.provider === "ollama"
+        ? { provider: "ollama" as const, ollama: { model: ai.ollama.model } }
+        : { provider: "mock" as const }
+  });
 }
 
 export function loadAIConfiguration(

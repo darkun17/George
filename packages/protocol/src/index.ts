@@ -163,6 +163,8 @@ export interface ApprovalRequest {
   readonly createdAt: string;
   readonly expiresAt: string;
   readonly status: ApprovalStatus;
+  /** A short, pre-sanitized label authored by trusted tool code; never raw Tool input. */
+  readonly summary?: string;
 }
 
 export type AgentEvent =

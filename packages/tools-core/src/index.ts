@@ -98,6 +98,8 @@ interface ToolResultBase {
   readonly policyOutcome?: PolicyDecision["outcome"];
   readonly riskLevel?: RiskLevel;
   readonly approvalHandle?: ToolApprovalHandle;
+  /** Safe, pre-sanitized approval label; only ever set alongside an approval_required result. */
+  readonly summary?: string;
   readonly startedAt: string;
   readonly completedAt: string;
   readonly durationMs: number;
@@ -274,6 +276,12 @@ export class ToolRuntime {
       const toolCallId = request.toolCallId ?? "";
       const handle: ToolApprovalHandle = Object.freeze({ toolId: tool.id, toolCallId });
       this.#pendingApprovals.set(handle, { request, input: parsed.data });
+      let summary: string | undefined;
+      try {
+        summary = tool.describeForApproval?.(parsed.data);
+      } catch {
+        summary = undefined;
+      }
       return this.#finish(
         request,
         executionId,
@@ -285,7 +293,8 @@ export class ToolRuntime {
         },
         tool,
         decision,
-        handle
+        handle,
+        summary
       );
     }
     if (approval && (approval.toolId !== tool.id || approval.toolCallId !== request.toolCallId)) {
@@ -462,7 +471,8 @@ export class ToolRuntime {
     outcome: ToolOutcome<unknown>,
     tool?: AnyToolDefinition,
     decision?: PolicyDecision,
-    approvalHandle?: ToolApprovalHandle
+    approvalHandle?: ToolApprovalHandle,
+    summary?: string
   ): Promise<ToolRuntimeResult> {
     const completed = this.#clock();
     const durationMs = Math.max(0, completed.getTime() - started.getTime());
@@ -518,10 +528,15 @@ export class ToolRuntime {
       };
     }
     return approvalHandle && result.status === "approval_required"
-      ? { ...result, approvalHandle }
+      ? { ...result, approvalHandle, ...(summary ? { summary } : {}) }
       : result;
   }
 }
 
 export { systemInfoTool } from "./system-info.js";
 export type { SystemInfo } from "./system-info.js";
+export { ApplicationRegistry } from "./application-registry.js";
+export type { TrustedApplication } from "./application-registry.js";
+export { createAppsListTool, createAppsOpenTool } from "./apps-tools.js";
+export { systemProcessListTool, parseTasklistCsv } from "./process-list-tool.js";
+export type { ProcessInfo } from "./process-list-tool.js";

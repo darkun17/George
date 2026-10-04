@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import type { AuditRecord } from "@george/protocol";
+import { getAppDataDir } from "./app-data.js";
 
 export interface SafeAuditEvent {
   readonly eventId: string;
@@ -25,11 +25,7 @@ export interface SafeAuditEvent {
 }
 
 export function getAuditDatabasePath(environment: NodeJS.ProcessEnv = process.env): string {
-  if (environment["LOCALAPPDATA"])
-    return join(environment["LOCALAPPDATA"], "George", "audit.sqlite");
-  if (environment["XDG_DATA_HOME"])
-    return join(environment["XDG_DATA_HOME"], "george", "audit.sqlite");
-  return join(homedir(), ".local", "share", "george", "audit.sqlite");
+  return join(getAppDataDir(environment), "audit.sqlite");
 }
 
 export class SqliteAuditSink {

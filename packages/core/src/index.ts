@@ -84,6 +84,7 @@ export interface AgentRuntimeOptions {
         readonly executionId: string;
         readonly toolId: string;
         readonly riskLevel: ApprovalRequest["riskLevel"];
+        readonly summary?: string;
       },
       continuation: () => Promise<AgentResponse>,
       dispose?: () => void
@@ -391,7 +392,8 @@ export class AgentRuntime {
                   toolCallId: call.id,
                   executionId,
                   toolId: call.toolId,
-                  riskLevel: result.riskLevel ?? "HIGH"
+                  riskLevel: result.riskLevel ?? "HIGH",
+                  ...(result.summary ? { summary: result.summary } : {})
                 },
                 () =>
                   this.#resumeApproved({
@@ -728,7 +730,8 @@ export class AgentRuntime {
               toolCallId: call.id,
               executionId,
               toolId: call.toolId,
-              riskLevel: result.riskLevel ?? "HIGH"
+              riskLevel: result.riskLevel ?? "HIGH",
+              ...(result.summary ? { summary: result.summary } : {})
             },
             () =>
               this.#resumeApproved({
