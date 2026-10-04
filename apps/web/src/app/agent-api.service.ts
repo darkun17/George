@@ -1,5 +1,5 @@
 import { Injectable } from "@angular/core";
-import type { AgentResponse } from "@george/protocol";
+import type { AgentResponse, ApprovalRequest } from "@george/protocol";
 import type { AIProviderInfo } from "@george/protocol";
 
 export interface AgentRequestPayload {
@@ -77,5 +77,55 @@ export class AgentApiService {
       if (typeof message === "string") throw new Error(message);
     }
     throw new Error("George no pudo completar la solicitud.");
+  }
+
+  async getApprovals(): Promise<readonly ApprovalRequest[]> {
+    const response = await fetch("/api/v1/approvals", { credentials: "same-origin" });
+    const result: unknown = await response.json();
+    if (!response.ok || typeof result !== "object" || result === null)
+      throw new Error("APPROVALS_UNAVAILABLE");
+    const approvals = (result as Record<string, unknown>)["approvals"];
+    if (!Array.isArray(approvals)) throw new Error("APPROVALS_UNAVAILABLE");
+    return approvals.filter((value): value is ApprovalRequest => {
+      if (typeof value !== "object" || value === null) return false;
+      const item = value as Record<string, unknown>;
+      return (
+        typeof item["approvalId"] === "string" &&
+        typeof item["toolId"] === "string" &&
+        ["PENDING", "APPROVED", "DENIED", "EXPIRED"].includes(String(item["status"]))
+      );
+    });
+  }
+
+  async resolveApproval(approvalId: string, decision: "approve" | "deny"): Promise<AgentResponse> {
+    if (!this.#csrfToken) throw new Error("La sesión local no está iniciada.");
+    const response = await fetch(
+      `/api/v1/approvals/${encodeURIComponent(approvalId)}/${decision}`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-George-CSRF": this.#csrfToken }
+      }
+    );
+    const result: unknown = await response.json();
+    if (typeof result !== "object" || result === null)
+      throw new Error("APPROVAL_RESOLUTION_FAILED");
+    const item = result as Record<string, unknown>;
+    if (
+      ["completed", "failed", "cancelled", "approval_required", "denied"].includes(
+        String(item["status"])
+      )
+    ) {
+      return item as unknown as AgentResponse;
+    }
+    const error = item["error"];
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      typeof (error as Record<string, unknown>)["code"] === "string"
+    ) {
+      throw new Error(String((error as Record<string, unknown>)["code"]));
+    }
+    throw new Error("APPROVAL_RESOLUTION_FAILED");
   }
 }

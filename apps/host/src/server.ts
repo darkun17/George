@@ -1,4 +1,4 @@
-import fastify, { type FastifyInstance } from "fastify";
+import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import fastifyStatic from "@fastify/static";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -6,12 +6,15 @@ import { createServer } from "node:http";
 import type { ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { AgentRuntime, InMemoryAuditSink } from "@george/core";
+import type { AuditSink } from "@george/protocol";
 import { createAIProvider, type ManagedAIProvider } from "@george/ai";
-import { loadAIConfiguration, loadHostConfiguration } from "@george/config";
+import { loadAIConfiguration, loadHostConfiguration, PermissionResolver } from "@george/config";
 import { DefaultPolicyEngine } from "@george/policy";
 import { InMemoryToolRegistry, ToolRuntime, systemInfoTool } from "@george/tools-core";
 import { SessionStore, readSessionCookie } from "./session-store.js";
 import { SseAgentEventSink } from "./sse-event-sink.js";
+import { PendingApprovalStore } from "./pending-approval-store.js";
+import { getAuditDatabasePath, SqliteAuditSink } from "./sqlite-audit-sink.js";
 
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
 const MAX_AGENT_INPUT_LENGTH = 4000;
@@ -23,6 +26,10 @@ export interface HostServerOptions {
   readonly serveWeb?: boolean;
   readonly aiProvider?: ManagedAIProvider;
   readonly grantedPermissions?: readonly string[];
+  readonly deniedPermissions?: readonly string[];
+  readonly auditSink?: AuditSink;
+  readonly auditDatabasePath?: string;
+  readonly approvalStore?: PendingApprovalStore;
 }
 
 function expectedOrigins(
@@ -88,7 +95,13 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   }
   const sessions = new SessionStore();
   const eventSink = new SseAgentEventSink();
-  const auditSink = new InMemoryAuditSink();
+  const ownsAuditSink = options.auditSink === undefined;
+  const auditSink =
+    options.auditSink ??
+    (environment["NODE_ENV"] === "test"
+      ? new InMemoryAuditSink()
+      : new SqliteAuditSink(options.auditDatabasePath ?? getAuditDatabasePath(environment)));
+  const approvalStore = options.approvalStore ?? new PendingApprovalStore(auditSink);
   const toolRegistry = new InMemoryToolRegistry();
   toolRegistry.register(systemInfoTool);
   const toolRuntime = new ToolRuntime({
@@ -96,13 +109,22 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     policyEngine: new DefaultPolicyEngine(),
     auditSink
   });
-  const grantedPermissions = options.grantedPermissions ?? config.tools.grantedPermissions;
+  const permissionResolver = new PermissionResolver(
+    options.grantedPermissions ?? config.tools.grantedPermissions,
+    options.deniedPermissions ?? config.tools.deniedPermissions
+  );
+  const environmentName = environment["NODE_ENV"] === "production" ? "production" : "development";
+  const permissions = permissionResolver.resolve("desktop", environmentName);
+  const grantedPermissions = permissions.grantedPermissions;
   const runtime = new AgentRuntime({
     aiProvider,
     eventSink,
     auditSink,
     toolRuntime,
-    grantedPermissions
+    grantedPermissions,
+    deniedPermissions: permissions.deniedPermissions,
+    permissionResolver: (channel) => permissionResolver.resolve(channel, environmentName),
+    approvalCoordinator: approvalStore
   });
   const sseResponses = new Set<ServerResponse>();
 
@@ -211,6 +233,120 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     return { tools: toolRegistry.listMetadata() };
   });
 
+  app.get("/api/v1/approvals", async (request, reply) => {
+    if (
+      !validateStreamOrigin(
+        request.headers.origin,
+        request.headers.referer,
+        request.headers["sec-fetch-site"],
+        request.headers.host
+      )
+    ) {
+      return reply
+        .code(403)
+        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+    }
+    const cookie = request.headers.cookie;
+    if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
+      return reply
+        .code(401)
+        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+    }
+    reply.header("Cache-Control", "no-store");
+    return { approvals: approvalStore.list() };
+  });
+
+  app.get("/api/v1/audit", async (request, reply) => {
+    if (
+      !validateStreamOrigin(
+        request.headers.origin,
+        request.headers.referer,
+        request.headers["sec-fetch-site"],
+        request.headers.host
+      )
+    ) {
+      return reply
+        .code(403)
+        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+    }
+    const cookie = request.headers.cookie;
+    if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
+      return reply
+        .code(401)
+        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+    }
+    const query =
+      request.query && typeof request.query === "object"
+        ? (request.query as Record<string, unknown>)
+        : {};
+    const value = query["limit"];
+    const limit = typeof value === "string" && /^\d{1,3}$/.test(value) ? Number(value) : 50;
+    reply.header("Cache-Control", "no-store");
+    return { events: auditSink instanceof SqliteAuditSink ? auditSink.recent(limit) : [] };
+  });
+
+  const resolveApproval = async (
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+    decision: "approve" | "deny"
+  ) => {
+    if (!validateOrigin(request.headers.origin))
+      return reply
+        .code(403)
+        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+    const cookie = request.headers.cookie;
+    const session = getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie);
+    if (!session)
+      return reply
+        .code(401)
+        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+    const csrf = request.headers["x-george-csrf"];
+    if (!sessions.validateCsrf(session, Array.isArray(csrf) ? csrf[0] : csrf))
+      return reply.code(403).send({
+        error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
+      });
+    reply.header("Cache-Control", "no-store");
+    const result =
+      decision === "approve"
+        ? await approvalStore.approve(request.params.id)
+        : approvalStore.deny(request.params.id);
+    if (result.status === "not_found")
+      return reply.code(404).send({
+        error: { code: "APPROVAL_NOT_FOUND", message: "La aprobación ya no está disponible." }
+      });
+    if (result.status === "expired")
+      return reply
+        .code(410)
+        .send({ error: { code: "APPROVAL_EXPIRED", message: "La aprobación expiró." } });
+    if (result.status === "already_resolved")
+      return reply
+        .code(409)
+        .send({ error: { code: "APPROVAL_RESOLVED", message: "La aprobación ya fue resuelta." } });
+    if (result.status !== "resolved")
+      return reply.code(503).send({
+        error: { code: "APPROVAL_UNAVAILABLE", message: "La aprobación no pudo resolverse." }
+      });
+    const response = result.response;
+    return reply
+      .code(
+        response.status === "approval_required"
+          ? 202
+          : response.status === "denied"
+            ? 403
+            : response.status === "failed"
+              ? 500
+              : 200
+      )
+      .send(response);
+  };
+
+  app.post<{ Params: { id: string } }>("/api/v1/approvals/:id/approve", (request, reply) =>
+    resolveApproval(request, reply, "approve")
+  );
+  app.post<{ Params: { id: string } }>("/api/v1/approvals/:id/deny", (request, reply) =>
+    resolveApproval(request, reply, "deny")
+  );
+
   app.post<{
     Params: { id: string };
     Body: { input?: unknown; conversationId?: unknown };
@@ -258,6 +394,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         input: body.input,
         channel: "desktop",
         grantedPermissions,
+        deniedPermissions: permissions.deniedPermissions,
         signal: controller.signal,
         ...(body.conversationId ? { conversationId: body.conversationId } : {})
       });
@@ -275,7 +412,9 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
                   : result.error.code === "INVALID_TOOL_INPUT"
                     ? 400
                     : 500;
-      return reply.code(statusCode).send(result);
+      const { approvalHandle: _privateApprovalHandle, ...safeResult } = result;
+      void _privateApprovalHandle;
+      return reply.code(statusCode).send(safeResult);
     } finally {
       clearTimeout(timeout);
       reply.raw.off("close", cancelWhenDisconnected);
@@ -451,9 +590,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   }
 
   const close = async (): Promise<void> => {
+    approvalStore.clear();
     for (const response of sseResponses) response.end();
     sseResponses.clear();
     await app.close();
+    if (ownsAuditSink && auditSink instanceof SqliteAuditSink) auditSink.close();
   };
 
   return { app, close };

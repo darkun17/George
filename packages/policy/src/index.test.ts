@@ -20,6 +20,17 @@ describe("DefaultPolicyEngine", () => {
     );
   });
 
+  it("lets an explicit deny override an otherwise present grant", () => {
+    expect(
+      engine.evaluate({
+        ...request,
+        requiredPermissions: ["system.info.read"],
+        grantedPermissions: ["system.info.read"],
+        deniedPermissions: ["system.info.read"]
+      }).outcome
+    ).toBe("DENY");
+  });
+
   it("asks for approval before high-risk execution", () => {
     expect(engine.evaluate({ ...request, riskLevel: "HIGH" }).outcome).toBe("ASK");
   });

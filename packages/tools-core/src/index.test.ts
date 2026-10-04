@@ -252,8 +252,8 @@ describe("ToolRuntime execution boundary", () => {
       error: { code: "TOOL_EXECUTION_FAILED", message: "The tool could not be completed." }
     });
     expect(JSON.stringify(result)).not.toContain("super-secret");
-    expect(auditRecords).toHaveLength(1);
-    expect(auditRecords[0]).toMatchObject({
+    expect(auditRecords).toHaveLength(2);
+    expect(auditRecords.at(-1)).toMatchObject({
       operation: "tool.execution",
       executionId: "execution-fixed",
       toolId: "test.echo",
@@ -284,7 +284,7 @@ describe("ToolRuntime execution boundary", () => {
       error: { code: "TOOL_TIMEOUT" }
     });
     expect(signal?.aborted).toBe(true);
-    expect(auditRecords[0]).toMatchObject({ status: "timed_out", errorCode: "TOOL_TIMEOUT" });
+    expect(auditRecords.at(-1)).toMatchObject({ status: "timed_out", errorCode: "TOOL_TIMEOUT" });
   });
 
   it("cancels an allowed handler when the caller signal aborts", async () => {
@@ -306,7 +306,7 @@ describe("ToolRuntime execution boundary", () => {
       status: "cancelled",
       error: { code: "TOOL_CANCELLED" }
     });
-    expect(auditRecords[0]).toMatchObject({ status: "cancelled" });
+    expect(auditRecords.at(-1)).toMatchObject({ status: "cancelled" });
   });
 
   it("returns cancellation without invoking the handler for a pre-aborted signal", async () => {
@@ -322,9 +322,10 @@ describe("ToolRuntime execution boundary", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it("contains audit sink failures", async () => {
+  it("fails closed when the mandatory pre-execution audit write fails", async () => {
     const registry = new InMemoryToolRegistry();
-    registry.register(createTool());
+    const handler = vi.fn(createTool().handler);
+    registry.register(createTool({ handler }));
     const runtime = new ToolRuntime({
       registry,
       policyEngine: { evaluate: () => ({ outcome: "ALLOW", reason: "ok" }) },
@@ -338,7 +339,55 @@ describe("ToolRuntime execution boundary", () => {
         channel: "desktop",
         grantedPermissions: ["test.echo.read"]
       })
+    ).resolves.toMatchObject({ status: "failed", error: { code: "AUDIT_WRITE_FAILED" } });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("re-evaluates policy on approval and consumes the exact operation once", async () => {
+    const handler = vi.fn(createTool().handler);
+    const evaluate = vi
+      .fn<PolicyEngine["evaluate"]>()
+      .mockReturnValueOnce({ outcome: "ASK", reason: "approval" })
+      .mockReturnValueOnce({ outcome: "ALLOW", reason: "approved" });
+    const { runtime, request } = setup({
+      tool: createTool({ handler }),
+      policyEngine: { evaluate }
+    });
+    const pending = await runtime.execute({ ...request, toolCallId: "provider-call" });
+    expect(pending.status).toBe("approval_required");
+    if (pending.status !== "approval_required" || !pending.approvalHandle)
+      throw new Error("Expected approval handle");
+    await expect(
+      runtime.executeApproved(
+        pending.approvalHandle,
+        { grantedPermissions: ["test.echo.read"], deniedPermissions: [] },
+        "approval-id"
+      )
     ).resolves.toMatchObject({ status: "completed" });
+    await expect(runtime.executeApproved(pending.approvalHandle)).resolves.toMatchObject({
+      status: "denied"
+    });
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("does not let approval override a newly denied permission", async () => {
+    const handler = vi.fn(createTool().handler);
+    const evaluate = vi
+      .fn<PolicyEngine["evaluate"]>()
+      .mockReturnValueOnce({ outcome: "ASK", reason: "approval" })
+      .mockReturnValueOnce({ outcome: "DENY", reason: "permission revoked" });
+    const { runtime, request } = setup({
+      tool: createTool({ handler }),
+      policyEngine: { evaluate }
+    });
+    const pending = await runtime.execute({ ...request, toolCallId: "provider-call" });
+    if (pending.status !== "approval_required" || !pending.approvalHandle)
+      throw new Error("Expected approval handle");
+    await expect(runtime.executeApproved(pending.approvalHandle)).resolves.toMatchObject({
+      status: "denied"
+    });
+    expect(handler).not.toHaveBeenCalled();
   });
 });
 

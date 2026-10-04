@@ -8,15 +8,18 @@ import type {
   AgentResponse,
   AuditRecord,
   AuditSink,
+  ApprovalRequest,
   AIMessage,
   AIProvider,
   AIProviderResult,
+  AIToolCallRequest,
   Channel
 } from "@george/protocol";
-import type { ToolRuntime } from "@george/tools-core";
+import type { ToolApprovalHandle, ToolRuntime } from "@george/tools-core";
 
 export const MAX_TOOL_ITERATIONS = 4;
 export const MAX_TOOL_CALLS_PER_TURN = 8;
+export const MAX_TOOL_CALLS_PER_REQUEST = 8;
 export const MAX_TOOL_RESULT_BYTES = 16 * 1024;
 
 export interface AgentEventSink {
@@ -66,6 +69,26 @@ export interface AgentRuntimeOptions {
   readonly eventSink: AgentEventSink;
   readonly toolRuntime?: ToolRuntime;
   readonly grantedPermissions?: readonly string[];
+  readonly deniedPermissions?: readonly string[];
+  readonly permissionResolver?: (channel: Channel) => {
+    readonly grantedPermissions: readonly string[];
+    readonly deniedPermissions: readonly string[];
+  };
+  readonly approvalCoordinator?: {
+    create(
+      input: {
+        readonly requestId: string;
+        readonly conversationId: string;
+        readonly channel: Channel;
+        readonly toolCallId: string;
+        readonly executionId: string;
+        readonly toolId: string;
+        readonly riskLevel: ApprovalRequest["riskLevel"];
+      },
+      continuation: () => Promise<AgentResponse>,
+      dispose?: () => void
+    ): ApprovalRequest | undefined;
+  };
   readonly clock?: AgentClock;
   readonly createId?: AgentIdGenerator;
 }
@@ -114,6 +137,7 @@ const safeMessageByCode: Record<AgentErrorCode, string> = {
   INVALID_TOOL_INPUT: "The tool input is invalid.",
   TOOL_EXECUTION_FAILED: "The tool could not be completed.",
   TOOL_TIMEOUT: "The tool exceeded its time limit.",
+  AUDIT_WRITE_FAILED: "The tool may have completed, but its result could not be audited.",
   APPROVAL_REQUIRED: "This tool request requires approval.",
   PERMISSION_DENIED: "Policy denied this tool request.",
   CANCELLED: "The request was cancelled.",
@@ -163,6 +187,8 @@ function mapToolErrorCode(code: string): AgentErrorCode {
       return "INVALID_TOOL_INPUT";
     case "TOOL_TIMEOUT":
       return "TOOL_TIMEOUT";
+    case "AUDIT_WRITE_FAILED":
+      return "AUDIT_WRITE_FAILED";
     case "TOOL_CANCELLED":
       return "CANCELLED";
     default:
@@ -231,6 +257,7 @@ export class AgentRuntime {
         { role: "user", content: request.input }
       ];
       let toolIterations = 0;
+      let toolCallsExecuted = 0;
       let providerResponse: AIProviderResult;
       while (true) {
         if (options.signal?.aborted) {
@@ -319,10 +346,18 @@ export class AgentRuntime {
         }
         toolIterations += 1;
         messages.push({ role: "assistant", content: "", toolCalls: providerResponse.calls });
-        for (const call of providerResponse.calls) {
+        for (let callIndex = 0; callIndex < providerResponse.calls.length; callIndex++) {
+          const call = providerResponse.calls[callIndex]!;
           if (options.signal?.aborted) {
             throw new AgentRuntimeError("CANCELLED", safeMessageByCode.CANCELLED);
           }
+          if (toolCallsExecuted >= MAX_TOOL_CALLS_PER_REQUEST) {
+            throw new AgentRuntimeError(
+              "MAX_TOOL_ITERATIONS",
+              safeMessageByCode.MAX_TOOL_ITERATIONS
+            );
+          }
+          toolCallsExecuted += 1;
           const executionId = this.#createId();
           await this.#emitToolEvent("tool.requested", request, requestId, {
             toolId: call.toolId,
@@ -335,7 +370,7 @@ export class AgentRuntime {
             toolId: call.toolId,
             input: call.input,
             channel: request.channel,
-            grantedPermissions: this.options.grantedPermissions ?? [],
+            ...this.#permissions(request.channel),
             requestId,
             conversationId: request.conversationId,
             ...(context.signal ? { signal: context.signal } : {})
@@ -345,6 +380,42 @@ export class AgentRuntime {
           }
           if (result.status === "approval_required" || result.status === "denied") {
             const approvalRequired = result.status === "approval_required";
+            let approval: ApprovalRequest | undefined;
+            let assignedApprovalId: string | undefined;
+            if (approvalRequired && result.approvalHandle && this.options.approvalCoordinator) {
+              approval = this.options.approvalCoordinator.create(
+                {
+                  requestId,
+                  conversationId: request.conversationId,
+                  channel: request.channel,
+                  toolCallId: call.id,
+                  executionId,
+                  toolId: call.toolId,
+                  riskLevel: result.riskLevel ?? "HIGH"
+                },
+                () =>
+                  this.#resumeApproved({
+                    request,
+                    requestId,
+                    startedAt,
+                    messages,
+                    remainingCalls:
+                      providerResponse.kind === "tool_calls"
+                        ? providerResponse.calls.slice(callIndex + 1)
+                        : [],
+                    toolIterations,
+                    toolCallsExecuted,
+                    handle: result.approvalHandle!,
+                    ...(assignedApprovalId ? { approvalId: assignedApprovalId } : {})
+                  }),
+                () => this.options.toolRuntime?.revokeApproval(result.approvalHandle!)
+              );
+              if (!approval) {
+                this.options.toolRuntime.revokeApproval(result.approvalHandle);
+                throw new AgentRuntimeError("INTERNAL_ERROR", safeMessageByCode.INTERNAL_ERROR);
+              }
+              assignedApprovalId = approval.approvalId;
+            }
             const completedAt = this.#clock();
             const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime());
             await this.#emitToolEvent(
@@ -373,6 +444,7 @@ export class AgentRuntime {
               toolId: call.toolId,
               executionId,
               toolCallId: call.id,
+              ...(approval ? { approvalId: approval.approvalId } : {}),
               error: {
                 code: approvalRequired ? "APPROVAL_REQUIRED" : "PERMISSION_DENIED",
                 message:
@@ -487,6 +559,392 @@ export class AgentRuntime {
         options.signal
       );
     }
+  }
+
+  async #resumeApproved(state: {
+    readonly request: AgentRequest;
+    readonly requestId: string;
+    readonly startedAt: Date;
+    readonly messages: AIMessage[];
+    readonly remainingCalls: readonly AIToolCallRequest[];
+    readonly toolIterations: number;
+    readonly toolCallsExecuted: number;
+    readonly handle: ToolApprovalHandle;
+    readonly approvalId?: string;
+  }): Promise<AgentResponse> {
+    const runtime = this.options.toolRuntime;
+    if (!runtime)
+      return this.#fail(
+        state.request,
+        state.requestId,
+        state.request.receivedAt,
+        this.#clock().toISOString(),
+        0,
+        new AgentRuntimeError(
+          "TOOL_CALLING_UNAVAILABLE",
+          safeMessageByCode.TOOL_CALLING_UNAVAILABLE
+        )
+      );
+    const current = await runtime.executeApproved(
+      state.handle,
+      this.#permissions(state.request.channel),
+      state.approvalId
+    );
+    if (current.status !== "completed") {
+      const denied = current.status === "denied" || current.status === "approval_required";
+      const at = this.#clock();
+      const durationMs = Math.max(0, at.getTime() - state.startedAt.getTime());
+      await this.#record({
+        request: state.request,
+        requestId: state.requestId,
+        status: denied ? "denied" : "failed",
+        timestamp: at.toISOString(),
+        durationMs,
+        errorCode: denied ? "PERMISSION_DENIED" : mapToolErrorCode(current.error.code)
+      });
+      if (denied) {
+        return {
+          status: "denied",
+          requestId: state.requestId,
+          conversationId: state.request.conversationId,
+          toolId: current.toolId,
+          executionId: current.executionId,
+          toolCallId: state.handle.toolCallId,
+          error: { code: "PERMISSION_DENIED", message: safeMessageByCode.PERMISSION_DENIED },
+          receivedAt: state.request.receivedAt,
+          completedAt: at.toISOString(),
+          durationMs
+        };
+      }
+      return {
+        status: "failed",
+        requestId: state.requestId,
+        conversationId: state.request.conversationId,
+        error: {
+          code: mapToolErrorCode(current.error.code),
+          message: safeMessageByCode.TOOL_EXECUTION_FAILED
+        },
+        receivedAt: state.request.receivedAt,
+        completedAt: at.toISOString(),
+        durationMs
+      };
+    }
+    let serialized: string;
+    try {
+      const output = JSON.stringify(current.output);
+      if (output === undefined || Buffer.byteLength(output, "utf8") > MAX_TOOL_RESULT_BYTES)
+        throw new Error("Invalid tool result.");
+      serialized = output;
+    } catch {
+      return this.#fail(
+        state.request,
+        state.requestId,
+        state.request.receivedAt,
+        this.#clock().toISOString(),
+        0,
+        new AgentRuntimeError("TOOL_RESULT_TOO_LARGE", safeMessageByCode.TOOL_RESULT_TOO_LARGE)
+      );
+    }
+    state.messages.push({
+      role: "tool",
+      toolCallId: state.handle.toolCallId,
+      toolId: state.handle.toolId,
+      content: serialized
+    });
+    await this.#emitToolEvent("tool.completed", state.request, state.requestId, {
+      toolId: state.handle.toolId,
+      executionId: current.executionId,
+      toolCallId: state.handle.toolCallId,
+      durationMs: current.durationMs
+    });
+    return this.#continueTranscript({
+      ...state,
+      remainingCalls: state.remainingCalls,
+      toolCallsExecuted: state.toolCallsExecuted
+    });
+  }
+
+  async #continueTranscript(state: {
+    readonly request: AgentRequest;
+    readonly requestId: string;
+    readonly startedAt: Date;
+    readonly messages: AIMessage[];
+    readonly remainingCalls: readonly AIToolCallRequest[];
+    readonly toolIterations: number;
+    readonly toolCallsExecuted: number;
+  }): Promise<AgentResponse> {
+    const runtime = this.options.toolRuntime;
+    if (!runtime)
+      return this.#fail(
+        state.request,
+        state.requestId,
+        state.request.receivedAt,
+        this.#clock().toISOString(),
+        0,
+        new AgentRuntimeError(
+          "TOOL_CALLING_UNAVAILABLE",
+          safeMessageByCode.TOOL_CALLING_UNAVAILABLE
+        )
+      );
+    let calls = state.remainingCalls;
+    let iterations = state.toolIterations;
+    let callCount = state.toolCallsExecuted;
+    while (true) {
+      for (let index = 0; index < calls.length; index++) {
+        const call = calls[index]!;
+        if (callCount >= MAX_TOOL_CALLS_PER_REQUEST) {
+          return this.#fail(
+            state.request,
+            state.requestId,
+            state.request.receivedAt,
+            this.#clock().toISOString(),
+            0,
+            new AgentRuntimeError("MAX_TOOL_ITERATIONS", safeMessageByCode.MAX_TOOL_ITERATIONS)
+          );
+        }
+        callCount++;
+        const executionId = this.#createId();
+        await this.#emitToolEvent("tool.requested", state.request, state.requestId, {
+          toolId: call.toolId,
+          executionId,
+          toolCallId: call.id
+        });
+        const result = await runtime.execute({
+          executionId,
+          toolCallId: call.id,
+          toolId: call.toolId,
+          input: call.input,
+          channel: state.request.channel,
+          ...this.#permissions(state.request.channel),
+          requestId: state.requestId,
+          conversationId: state.request.conversationId
+        });
+        if (result.status === "approval_required" && result.approvalHandle) {
+          const approval: ApprovalRequest | undefined = this.options.approvalCoordinator?.create(
+            {
+              requestId: state.requestId,
+              conversationId: state.request.conversationId,
+              channel: state.request.channel,
+              toolCallId: call.id,
+              executionId,
+              toolId: call.toolId,
+              riskLevel: result.riskLevel ?? "HIGH"
+            },
+            () =>
+              this.#resumeApproved({
+                request: state.request,
+                requestId: state.requestId,
+                startedAt: state.startedAt,
+                messages: state.messages,
+                remainingCalls: calls.slice(index + 1),
+                toolIterations: iterations,
+                toolCallsExecuted: callCount,
+                handle: result.approvalHandle!,
+                ...(approval ? { approvalId: approval.approvalId } : {})
+              }),
+            () => runtime.revokeApproval(result.approvalHandle!)
+          );
+          if (!approval) {
+            runtime.revokeApproval(result.approvalHandle);
+            return this.#fail(
+              state.request,
+              state.requestId,
+              state.request.receivedAt,
+              this.#clock().toISOString(),
+              0,
+              new AgentRuntimeError("INTERNAL_ERROR", safeMessageByCode.INTERNAL_ERROR)
+            );
+          }
+          const at = this.#clock();
+          await this.#emitToolEvent("tool.approval_required", state.request, state.requestId, {
+            toolId: call.toolId,
+            executionId,
+            toolCallId: call.id,
+            durationMs: result.durationMs
+          });
+          await this.#record({
+            request: state.request,
+            requestId: state.requestId,
+            status: "approval_required",
+            timestamp: at.toISOString(),
+            durationMs: at.getTime() - state.startedAt.getTime(),
+            errorCode: "APPROVAL_REQUIRED"
+          });
+          return {
+            status: "approval_required",
+            requestId: state.requestId,
+            conversationId: state.request.conversationId,
+            toolId: call.toolId,
+            executionId,
+            toolCallId: call.id,
+            approvalId: approval.approvalId,
+            error: { code: "APPROVAL_REQUIRED", message: safeMessageByCode.APPROVAL_REQUIRED },
+            receivedAt: state.request.receivedAt,
+            completedAt: at.toISOString(),
+            durationMs: Math.max(0, at.getTime() - state.startedAt.getTime())
+          };
+        }
+        if (result.status === "denied") {
+          const at = this.#clock();
+          await this.#emitToolEvent("tool.denied", state.request, state.requestId, {
+            toolId: call.toolId,
+            executionId,
+            toolCallId: call.id,
+            durationMs: result.durationMs
+          });
+          await this.#record({
+            request: state.request,
+            requestId: state.requestId,
+            status: "denied",
+            timestamp: at.toISOString(),
+            durationMs: at.getTime() - state.startedAt.getTime(),
+            errorCode: "PERMISSION_DENIED"
+          });
+          return {
+            status: "denied",
+            requestId: state.requestId,
+            conversationId: state.request.conversationId,
+            toolId: call.toolId,
+            executionId,
+            toolCallId: call.id,
+            error: { code: "PERMISSION_DENIED", message: safeMessageByCode.PERMISSION_DENIED },
+            receivedAt: state.request.receivedAt,
+            completedAt: at.toISOString(),
+            durationMs: Math.max(0, at.getTime() - state.startedAt.getTime())
+          };
+        }
+        if (result.status !== "completed")
+          return this.#fail(
+            state.request,
+            state.requestId,
+            state.request.receivedAt,
+            this.#clock().toISOString(),
+            0,
+            new AgentRuntimeError(
+              mapToolErrorCode(result.error.code),
+              safeMessageByCode[mapToolErrorCode(result.error.code)]
+            )
+          );
+        const output = JSON.stringify(result.output);
+        if (output === undefined || Buffer.byteLength(output, "utf8") > MAX_TOOL_RESULT_BYTES)
+          return this.#fail(
+            state.request,
+            state.requestId,
+            state.request.receivedAt,
+            this.#clock().toISOString(),
+            0,
+            new AgentRuntimeError("TOOL_RESULT_TOO_LARGE", safeMessageByCode.TOOL_RESULT_TOO_LARGE)
+          );
+        state.messages.push({
+          role: "tool",
+          toolCallId: call.id,
+          toolId: call.toolId,
+          content: output
+        });
+      }
+      await this.#emit({
+        type: "provider.started",
+        request: state.request,
+        requestId: state.requestId,
+        timestamp: this.#clock().toISOString()
+      });
+      let response: AIProviderResult;
+      try {
+        response = await this.options.aiProvider.chat(state.messages, {
+          tools: runtime.listAITools()
+        });
+      } catch (error) {
+        return this.#fail(
+          state.request,
+          state.requestId,
+          state.request.receivedAt,
+          this.#clock().toISOString(),
+          0,
+          new AgentRuntimeError("PROVIDER_ERROR", safeMessageByCode.PROVIDER_ERROR, {
+            cause: error
+          })
+        );
+      }
+      if (response.kind === "message" && typeof response.text === "string") {
+        const at = this.#clock();
+        const durationMs = Math.max(0, at.getTime() - state.startedAt.getTime());
+        await this.#record({
+          request: state.request,
+          requestId: state.requestId,
+          status: "completed",
+          timestamp: at.toISOString(),
+          durationMs
+        });
+        await this.#emit({
+          type: "provider.completed",
+          request: state.request,
+          requestId: state.requestId,
+          timestamp: at.toISOString()
+        });
+        await this.#emit({
+          type: "request.completed",
+          request: state.request,
+          requestId: state.requestId,
+          timestamp: at.toISOString()
+        });
+        return {
+          status: "completed",
+          requestId: state.requestId,
+          conversationId: state.request.conversationId,
+          content: response.text,
+          receivedAt: state.request.receivedAt,
+          completedAt: at.toISOString(),
+          durationMs
+        };
+      }
+      if (
+        response.kind !== "tool_calls" ||
+        !Array.isArray(response.calls) ||
+        response.calls.length === 0 ||
+        response.calls.length > MAX_TOOL_CALLS_PER_TURN ||
+        response.calls.some(
+          (call) =>
+            !call ||
+            typeof call.id !== "string" ||
+            !call.id ||
+            typeof call.toolId !== "string" ||
+            !call.toolId
+        )
+      ) {
+        return this.#fail(
+          state.request,
+          state.requestId,
+          state.request.receivedAt,
+          this.#clock().toISOString(),
+          0,
+          new AgentRuntimeError("PROVIDER_ERROR", safeMessageByCode.PROVIDER_ERROR)
+        );
+      }
+      if (iterations >= MAX_TOOL_ITERATIONS)
+        return this.#fail(
+          state.request,
+          state.requestId,
+          state.request.receivedAt,
+          this.#clock().toISOString(),
+          0,
+          new AgentRuntimeError("MAX_TOOL_ITERATIONS", safeMessageByCode.MAX_TOOL_ITERATIONS)
+        );
+      iterations++;
+      calls = response.calls;
+      state.messages.push({ role: "assistant", content: "", toolCalls: calls });
+    }
+  }
+
+  #permissions(channel: Channel): {
+    readonly grantedPermissions: readonly string[];
+    readonly deniedPermissions: readonly string[];
+  } {
+    return (
+      this.options.permissionResolver?.(channel) ?? {
+        grantedPermissions: this.options.grantedPermissions ?? [],
+        deniedPermissions: this.options.deniedPermissions ?? []
+      }
+    );
   }
 
   async #fail(
@@ -690,7 +1148,9 @@ export class AgentRuntime {
     try {
       await this.options.auditSink.record(record);
     } catch {
-      // A sink failure is not exposed as a provider failure or returned to the caller.
+      process.emitWarning(
+        "George request audit write failed; continuing with the non-tool request."
+      );
     }
   }
 }

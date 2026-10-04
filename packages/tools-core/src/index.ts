@@ -5,7 +5,8 @@ import type {
   Channel,
   PolicyDecision,
   ToolExecutionContext,
-  ToolExecutionResult
+  ToolExecutionResult,
+  RiskLevel
 } from "@george/protocol";
 import type { PolicyEngine, PolicyRequest } from "@george/policy";
 import type { AnyToolDefinition } from "@george/tools-sdk";
@@ -76,9 +77,17 @@ export interface ToolExecutionRequest {
   readonly input: unknown;
   readonly channel: Channel;
   readonly grantedPermissions: readonly string[];
+  readonly deniedPermissions?: readonly string[];
+  readonly approvalId?: string;
   readonly requestId?: string;
   readonly conversationId?: string;
   readonly signal?: AbortSignal;
+}
+
+/** An opaque in-process handle; it is never part of an HTTP response. */
+export interface ToolApprovalHandle {
+  readonly toolId: string;
+  readonly toolCallId: string;
 }
 
 interface ToolResultBase {
@@ -87,6 +96,8 @@ interface ToolResultBase {
   readonly requestId?: string;
   readonly conversationId?: string;
   readonly policyOutcome?: PolicyDecision["outcome"];
+  readonly riskLevel?: RiskLevel;
+  readonly approvalHandle?: ToolApprovalHandle;
   readonly startedAt: string;
   readonly completedAt: string;
   readonly durationMs: number;
@@ -97,6 +108,7 @@ export type ToolRuntimeResult<TOutput = unknown> =
   | (ToolResultBase & {
       readonly status: "failed" | "denied" | "approval_required" | "cancelled" | "timed_out";
       readonly error: { readonly code: string; readonly message: string };
+      readonly approvalHandle?: ToolApprovalHandle;
     });
 
 type ToolOutcome<TOutput> =
@@ -122,6 +134,10 @@ export class ToolRuntime {
   readonly #maxTimeoutMs: number;
   readonly #createId: () => string;
   readonly #clock: () => Date;
+  readonly #pendingApprovals = new Map<
+    ToolApprovalHandle,
+    { readonly request: ToolExecutionRequest; readonly input: unknown }
+  >();
 
   constructor(private readonly options: ToolRuntimeOptions) {
     this.#defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
@@ -142,7 +158,54 @@ export class ToolRuntime {
     return this.options.registry.listAITools();
   }
 
-  async execute(request: ToolExecutionRequest): Promise<ToolRuntimeResult> {
+  execute(request: ToolExecutionRequest): Promise<ToolRuntimeResult> {
+    return this.#execute(request);
+  }
+
+  async executeApproved(
+    handle: ToolApprovalHandle,
+    permissions?: {
+      readonly grantedPermissions: readonly string[];
+      readonly deniedPermissions: readonly string[];
+    },
+    approvalId?: string
+  ): Promise<ToolRuntimeResult> {
+    const pending = this.#pendingApprovals.get(handle);
+    if (!pending) {
+      return this.#finish(
+        {
+          executionId: "unknown",
+          toolId: handle.toolId,
+          input: null,
+          channel: "desktop",
+          grantedPermissions: []
+        },
+        "unknown",
+        this.#clock(),
+        { status: "denied", code: "APPROVAL_INVALID", message: "The approval is no longer valid." }
+      );
+    }
+    this.#pendingApprovals.delete(handle);
+    const request: ToolExecutionRequest = {
+      ...pending.request,
+      input: pending.input,
+      ...(permissions ?? {
+        grantedPermissions: pending.request.grantedPermissions,
+        deniedPermissions: pending.request.deniedPermissions ?? []
+      }),
+      ...(approvalId ? { approvalId } : {})
+    };
+    return this.#execute(request, handle);
+  }
+
+  revokeApproval(handle: ToolApprovalHandle): void {
+    this.#pendingApprovals.delete(handle);
+  }
+
+  async #execute(
+    request: ToolExecutionRequest,
+    approval?: ToolApprovalHandle
+  ): Promise<ToolRuntimeResult> {
     const executionId = request.executionId || this.#createId();
     const started = this.#clock();
     const tool = this.options.registry.get(request.toolId);
@@ -175,7 +238,8 @@ export class ToolRuntime {
         toolId: tool.id,
         riskLevel: tool.riskLevel,
         requiredPermissions: tool.requiredPermissions,
-        grantedPermissions: request.grantedPermissions
+        grantedPermissions: request.grantedPermissions,
+        deniedPermissions: request.deniedPermissions ?? []
       };
       decision = this.options.policyEngine.evaluate(policyRequest);
     } catch {
@@ -206,7 +270,10 @@ export class ToolRuntime {
         decision
       );
     }
-    if (decision.outcome === "ASK") {
+    if (decision.outcome === "ASK" && !approval) {
+      const toolCallId = request.toolCallId ?? "";
+      const handle: ToolApprovalHandle = Object.freeze({ toolId: tool.id, toolCallId });
+      this.#pendingApprovals.set(handle, { request, input: parsed.data });
       return this.#finish(
         request,
         executionId,
@@ -217,10 +284,25 @@ export class ToolRuntime {
           message: "This tool request requires approval."
         },
         tool,
+        decision,
+        handle
+      );
+    }
+    if (approval && (approval.toolId !== tool.id || approval.toolCallId !== request.toolCallId)) {
+      return this.#finish(
+        request,
+        executionId,
+        started,
+        {
+          status: "denied",
+          code: "APPROVAL_MISMATCH",
+          message: "The approval does not match this operation."
+        },
+        tool,
         decision
       );
     }
-    if (decision.outcome !== "ALLOW") {
+    if (decision.outcome !== "ALLOW" && !(decision.outcome === "ASK" && approval)) {
       return this.#finish(
         request,
         executionId,
@@ -242,6 +324,43 @@ export class ToolRuntime {
           status: "cancelled",
           code: "TOOL_CANCELLED",
           message: "The tool request was cancelled."
+        },
+        tool,
+        decision
+      );
+    }
+
+    try {
+      await this.options.auditSink.record({
+        executionId,
+        ...(request.toolCallId ? { toolCallId: request.toolCallId } : {}),
+        ...(request.approvalId
+          ? { approvalId: request.approvalId, approvalStatus: "approved" as const }
+          : {}),
+        ...(request.approvalId
+          ? { approvalId: request.approvalId, approvalStatus: "approved" as const }
+          : {}),
+        toolId: request.toolId,
+        ...(request.requestId ? { requestId: request.requestId } : {}),
+        ...(request.conversationId ? { conversationId: request.conversationId } : {}),
+        channel: request.channel,
+        operation: "tool.execution",
+        status: "requested",
+        occurredAt: started.toISOString(),
+        durationMs: 0,
+        riskLevel: tool.riskLevel,
+        policyOutcome: decision.outcome,
+        metadata: {}
+      });
+    } catch {
+      return this.#finish(
+        request,
+        executionId,
+        started,
+        {
+          status: "failed",
+          code: "AUDIT_WRITE_FAILED",
+          message: "Audit storage is unavailable; the tool was not executed."
         },
         tool,
         decision
@@ -342,7 +461,8 @@ export class ToolRuntime {
     started: Date,
     outcome: ToolOutcome<unknown>,
     tool?: AnyToolDefinition,
-    decision?: PolicyDecision
+    decision?: PolicyDecision,
+    approvalHandle?: ToolApprovalHandle
   ): Promise<ToolRuntimeResult> {
     const completed = this.#clock();
     const durationMs = Math.max(0, completed.getTime() - started.getTime());
@@ -352,6 +472,7 @@ export class ToolRuntime {
       ...(request.requestId ? { requestId: request.requestId } : {}),
       ...(request.conversationId ? { conversationId: request.conversationId } : {}),
       ...(decision ? { policyOutcome: decision.outcome } : {}),
+      ...(tool ? { riskLevel: tool.riskLevel } : {}),
       startedAt: started.toISOString(),
       completedAt: completed.toISOString(),
       durationMs
@@ -365,6 +486,7 @@ export class ToolRuntime {
             error: { code: outcome.code, message: outcome.message }
           };
 
+    let auditFailed = false;
     try {
       await this.options.auditSink.record({
         executionId,
@@ -383,9 +505,21 @@ export class ToolRuntime {
         metadata: {}
       });
     } catch {
-      // Audit sink faults do not reveal internals or change the tool result.
+      auditFailed = true;
     }
-    return result;
+    if (auditFailed && result.status === "completed") {
+      return {
+        ...base,
+        status: "failed",
+        error: {
+          code: "AUDIT_WRITE_FAILED",
+          message: "The tool may have completed, but its result could not be audited."
+        }
+      };
+    }
+    return approvalHandle && result.status === "approval_required"
+      ? { ...result, approvalHandle }
+      : result;
   }
 }
 

@@ -74,6 +74,45 @@
         }
       </section>
 
+      @for (approval of facade.approvals(); track approval.approvalId) {
+        <section class="approval-card" aria-label="Aprobación requerida">
+          <div>
+            <p class="eyebrow">GEORGE NECESITA AUTORIZACIÓN</p>
+            <h2>Permitir una acción</h2>
+            <p>
+              Herramienta: <strong>{{ approval.toolId }}</strong>
+            </p>
+            <p>
+              Riesgo: <strong>{{ approval.riskLevel }}</strong>
+            </p>
+            <small>Expira {{ approval.expiresAt | date: "HH:mm:ss" }}</small>
+            @if (approval.status === "EXPIRED") {
+              <p role="status">Esta autorización expiró.</p>
+            }
+          </div>
+          <div class="approval-actions">
+            <button
+              type="button"
+              [disabled]="approvalActionDisabled(approval)"
+              (click)="resolveApproval(approval.approvalId, 'deny')"
+            >
+              Denegar
+            </button>
+            <button
+              type="button"
+              [disabled]="approvalActionDisabled(approval)"
+              (click)="resolveApproval(approval.approvalId, 'approve')"
+            >
+              {{
+                facade.resolvingApprovals().includes(approval.approvalId)
+                  ? "Procesando…"
+                  : "Permitir una vez"
+              }}
+            </button>
+          </div>
+        </section>
+      }
+
       <form class="composer" (submit)="$event.preventDefault(); submit()">
         <label class="visually-hidden" for="prompt">Escribe un mensaje para George</label>
         <span class="composer-symbol" aria-hidden="true">›</span>

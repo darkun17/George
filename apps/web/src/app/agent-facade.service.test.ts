@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "@george/protocol";
 import {
   activityLabel,
+  isApprovalActionDisabled,
   mapAIStatus,
   reduceAgentState,
   safeAgentError
@@ -81,5 +82,14 @@ describe("agent activity presentation", () => {
     expect(JSON.stringify([requested, completed, approval])).not.toMatch(
       /hostname|totalMemory|output/
     );
+  });
+
+  it("keeps approval actions one-time and disabled while resolving or after expiration", () => {
+    expect(isApprovalActionDisabled("PENDING", false)).toBe(false);
+    expect(isApprovalActionDisabled("PENDING", true)).toBe(true);
+    expect(isApprovalActionDisabled("EXPIRED", false)).toBe(true);
+    expect(isApprovalActionDisabled("APPROVED", false)).toBe(true);
+    expect(isApprovalActionDisabled("DENIED", false)).toBe(true);
+    expect(reduceAgentState("WAITING_APPROVAL", event("request.completed"))).toBe("READY");
   });
 });

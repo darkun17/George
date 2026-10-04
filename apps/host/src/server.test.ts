@@ -1,22 +1,26 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { AIProviderError, type ManagedAIProvider } from "@george/ai";
-import type { AIMessage, AIProviderResult } from "@george/protocol";
+import type { AIMessage, AIProviderResult, AgentResponse } from "@george/protocol";
+import { InMemoryAuditSink } from "@george/core";
 import type { FastifyInstance } from "fastify";
 import { buildHostServer } from "./server.js";
+import { PendingApprovalStore } from "./pending-approval-store.js";
 
 const ORIGIN = "http://127.0.0.1:4200";
 const servers: Array<{ app: FastifyInstance; close: () => Promise<void> }> = [];
 
 async function createServer(
   aiProvider?: ManagedAIProvider,
-  grantedPermissions?: readonly string[]
+  grantedPermissions?: readonly string[],
+  approvalStore?: PendingApprovalStore
 ) {
   const server = await buildHostServer({
     environment: { NODE_ENV: "test" },
     origins: [ORIGIN],
     serveWeb: false,
     ...(aiProvider ? { aiProvider } : {}),
-    ...(grantedPermissions ? { grantedPermissions } : {})
+    ...(grantedPermissions ? { grantedPermissions } : {}),
+    ...(approvalStore ? { approvalStore } : {})
   });
   servers.push(server);
   return server.app;
@@ -201,7 +205,11 @@ describe("George Host HTTP boundary", () => {
       method: "POST",
       url: "/api/v1/tools/system.info/execute",
       headers,
-      payload: { input: {} }
+      payload: {
+        input: {},
+        permissions: ["system.info.read"],
+        grantedPermissions: ["system.info.read"]
+      }
     });
     expect(denied.statusCode).toBe(403);
     expect(denied.json()).toMatchObject({
@@ -425,5 +433,138 @@ describe("George Host HTTP boundary", () => {
       headers: { host: "127.0.0.1:4200", "sec-fetch-site": "cross-site" }
     });
     expect(crossSiteFetch.statusCode).toBe(403);
+  });
+
+  it("protects approval listing and resolution with session, exact Origin, and CSRF", async () => {
+    const audit = new InMemoryAuditSink();
+    let executionCount = 0;
+    const store = new PendingApprovalStore(audit, { createId: () => "approval-test-id" });
+    const response: AgentResponse = {
+      status: "completed",
+      requestId: "request-1",
+      conversationId: "conversation-1",
+      content: "continued",
+      receivedAt: "2026-10-03T12:00:00.000Z",
+      completedAt: "2026-10-03T12:00:01.000Z",
+      durationMs: 1000
+    };
+    store.create(
+      {
+        requestId: "request-1",
+        conversationId: "conversation-1",
+        channel: "desktop",
+        toolCallId: "call-1",
+        executionId: "execution-1",
+        toolId: "test.high-risk",
+        riskLevel: "HIGH"
+      },
+      async () => {
+        executionCount++;
+        return response;
+      }
+    );
+    const app = await createServer(undefined, undefined, store);
+    await expect(
+      app.inject({ method: "GET", url: "/api/v1/approvals", headers: { origin: ORIGIN } })
+    ).resolves.toMatchObject({ statusCode: 401 });
+    const session = await bootstrap(app);
+    const cookie = session.cookie!;
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/approvals",
+      headers: { origin: ORIGIN, cookie }
+    });
+    expect(list.statusCode).toBe(200);
+    expect(list.json()).toMatchObject({
+      approvals: [{ approvalId: "approval-test-id", toolId: "test.high-risk", status: "PENDING" }]
+    });
+    expect(list.body).not.toContain("input");
+    const unauthenticatedAudit = await app.inject({
+      method: "GET",
+      url: "/api/v1/audit",
+      headers: { origin: ORIGIN }
+    });
+    expect(unauthenticatedAudit.statusCode).toBe(401);
+    const auditResponse = await app.inject({
+      method: "GET",
+      url: "/api/v1/audit?limit=1000",
+      headers: { origin: ORIGIN, cookie }
+    });
+    expect(auditResponse.statusCode).toBe(200);
+    expect(auditResponse.json()).toEqual({ events: [] });
+
+    const noCsrf = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/approval-test-id/approve",
+      headers: { origin: ORIGIN, cookie }
+    });
+    expect(noCsrf.statusCode).toBe(403);
+    const badOrigin = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/approval-test-id/approve",
+      headers: { origin: "https://attacker.invalid", cookie, "x-george-csrf": session.csrfToken }
+    });
+    expect(badOrigin.statusCode).toBe(403);
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/unknown-id/approve",
+      headers: { origin: ORIGIN, cookie, "x-george-csrf": session.csrfToken }
+    });
+    expect(unknown.statusCode).toBe(404);
+    const approved = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/approval-test-id/approve",
+      headers: { origin: ORIGIN, cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: { forged: true } }
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json()).toMatchObject({ status: "completed", content: "continued" });
+    expect(executionCount).toBe(1);
+    const replay = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/approval-test-id/approve",
+      headers: { origin: ORIGIN, cookie, "x-george-csrf": session.csrfToken }
+    });
+    expect(replay.statusCode).toBe(409);
+    expect(executionCount).toBe(1);
+  });
+
+  it("requires CSRF to deny and never resumes a denied continuation", async () => {
+    const store = new PendingApprovalStore(new InMemoryAuditSink(), {
+      createId: () => "approval-deny-id"
+    });
+    let executionCount = 0;
+    store.create(
+      {
+        requestId: "r",
+        conversationId: "c",
+        channel: "desktop",
+        toolCallId: "call",
+        executionId: "execution",
+        toolId: "test.high-risk",
+        riskLevel: "HIGH"
+      },
+      async () => {
+        executionCount++;
+        return {
+          status: "failed",
+          requestId: "r",
+          conversationId: "c",
+          error: { code: "INTERNAL_ERROR", message: "failed" },
+          receivedAt: "2026-10-03T12:00:00Z",
+          completedAt: "2026-10-03T12:00:01Z",
+          durationMs: 1
+        };
+      }
+    );
+    const app = await createServer(undefined, undefined, store);
+    const session = await bootstrap(app);
+    const result = await app.inject({
+      method: "POST",
+      url: "/api/v1/approvals/approval-deny-id/deny",
+      headers: { origin: ORIGIN, cookie: session.cookie!, "x-george-csrf": session.csrfToken }
+    });
+    expect(result.statusCode).toBe(403);
+    expect(executionCount).toBe(0);
   });
 });

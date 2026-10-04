@@ -105,6 +105,7 @@ export type AgentErrorCode =
   | "INVALID_TOOL_INPUT"
   | "TOOL_EXECUTION_FAILED"
   | "TOOL_TIMEOUT"
+  | "AUDIT_WRITE_FAILED"
   | "APPROVAL_REQUIRED"
   | "PERMISSION_DENIED"
   | "CANCELLED"
@@ -142,11 +143,27 @@ export type AgentResponse =
       readonly toolId: string;
       readonly executionId: string;
       readonly toolCallId: string;
+      readonly approvalId?: string;
       readonly error: AgentError;
       readonly receivedAt: string;
       readonly completedAt: string;
       readonly durationMs: number;
     };
+
+export type ApprovalStatus = "PENDING" | "APPROVED" | "DENIED" | "EXPIRED";
+
+/** Safe approval metadata exposed to the local browser client. */
+export interface ApprovalRequest {
+  readonly approvalId: string;
+  readonly requestId: string;
+  readonly conversationId: string;
+  readonly toolCallId: string;
+  readonly toolId: string;
+  readonly riskLevel: RiskLevel;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly status: ApprovalStatus;
+}
 
 export type AgentEvent =
   | AgentEventBase<"request.received">
@@ -232,12 +249,15 @@ export interface AgentAuditRecord {
 export interface ToolAuditRecord {
   readonly executionId: string;
   readonly toolCallId?: string;
+  readonly approvalId?: string;
+  readonly approvalStatus?: "approved" | "denied" | "expired";
   readonly toolId: string;
   readonly requestId?: string;
   readonly conversationId?: string;
   readonly channel: Channel;
   readonly operation: "tool.execution";
   readonly status:
+    | "requested"
     | "completed"
     | "failed"
     | "denied"
@@ -252,7 +272,24 @@ export interface ToolAuditRecord {
   readonly metadata: Readonly<Record<string, string | number | boolean>>;
 }
 
-export type AuditRecord = AgentAuditRecord | ToolAuditRecord;
+export interface ApprovalAuditRecord {
+  readonly status?: never;
+  readonly eventId: string;
+  readonly occurredAt: string;
+  readonly operation: "approval.decision";
+  readonly requestId: string;
+  readonly conversationId: string;
+  readonly channel: Channel;
+  readonly toolId: string;
+  readonly toolCallId: string;
+  readonly executionId: string;
+  readonly approvalId: string;
+  readonly riskLevel: RiskLevel;
+  readonly decision: "requested" | "approved" | "denied" | "expired";
+  readonly metadata: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type AuditRecord = AgentAuditRecord | ToolAuditRecord | ApprovalAuditRecord;
 
 export interface AuditSink {
   record(record: AuditRecord): void | Promise<void>;

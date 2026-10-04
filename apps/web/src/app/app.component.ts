@@ -1,7 +1,8 @@
 import { Component, inject, signal } from "@angular/core";
 import type { OnDestroy, OnInit } from "@angular/core";
 import { DatePipe } from "@angular/common";
-import { AgentFacade } from "./agent-facade.service.js";
+import { AgentFacade, isApprovalActionDisabled } from "./agent-facade.service.js";
+import type { ApprovalRequest } from "@george/protocol";
 
 @Component({
   selector: "george-root",
@@ -31,5 +32,16 @@ export class AppComponent implements OnInit, OnDestroy {
 
   onInput(event: Event): void {
     this.input.set((event.target as HTMLInputElement).value);
+  }
+
+  resolveApproval(approvalId: string, decision: "approve" | "deny"): void {
+    void this.facade.resolveApproval(approvalId, decision);
+  }
+
+  approvalActionDisabled(approval: ApprovalRequest): boolean {
+    return isApprovalActionDisabled(
+      approval.status,
+      this.facade.resolvingApprovals().includes(approval.approvalId)
+    );
   }
 }

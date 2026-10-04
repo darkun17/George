@@ -5,6 +5,7 @@ import {
   aiConfigurationSchema,
   loadAIConfiguration,
   loadHostConfiguration,
+  PermissionResolver,
   parseAssistantProfile
 } from "./index.js";
 
@@ -61,7 +62,7 @@ describe("loadHostConfiguration", () => {
   it("defaults to loopback and the configured local port", () => {
     expect(loadHostConfiguration({})).toEqual({
       host: { address: "127.0.0.1", port: 43100 },
-      tools: { grantedPermissions: ["system.info.read"] }
+      tools: { grantedPermissions: ["system.info.read"], deniedPermissions: [] }
     });
   });
 
@@ -77,11 +78,16 @@ describe("loadHostConfiguration", () => {
 
   it("allows explicit permission configuration and rejects malformed or duplicate grants", () => {
     expect(loadHostConfiguration({ GEORGE_TOOL_PERMISSIONS: "system.info.read" }).tools).toEqual({
-      grantedPermissions: ["system.info.read"]
+      grantedPermissions: ["system.info.read"],
+      deniedPermissions: []
     });
     expect(loadHostConfiguration({ GEORGE_TOOL_PERMISSIONS: "" }).tools.grantedPermissions).toEqual(
       []
     );
+    expect(
+      loadHostConfiguration({ GEORGE_TOOL_DENY_PERMISSIONS: "project.open" }).tools
+        .deniedPermissions
+    ).toEqual(["project.open"]);
     expect(() =>
       hostConfigurationSchema.parse({
         host: { address: "127.0.0.1", port: 43100 },
@@ -95,5 +101,16 @@ describe("loadHostConfiguration", () => {
       "system.info.read"
     ]);
     expect(loadHostConfiguration({ NODE_ENV: "production" }).tools.grantedPermissions).toEqual([]);
+  });
+
+  it("resolves explicit grants and denials with deny taking precedence", () => {
+    const resolver = new PermissionResolver(["system.info.read", "project.open"], ["project.open"]);
+    expect(resolver.resolve("desktop", "production")).toEqual({
+      grantedPermissions: ["system.info.read"],
+      deniedPermissions: ["project.open"]
+    });
+    expect(() => loadHostConfiguration({ GEORGE_TOOL_PERMISSIONS: "*" })).toThrow(
+      InvalidConfigurationError
+    );
   });
 });

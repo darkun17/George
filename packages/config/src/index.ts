@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { Channel } from "@george/protocol";
 import defaults from "../../../george.defaults.json" with { type: "json" };
 
 export const assistantProfileSchema = z.object({
@@ -42,7 +43,12 @@ export const hostConfigurationSchema = z.object({
     grantedPermissions: z
       .array(z.string().regex(/^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/))
       .max(128)
+      .refine((permissions) => new Set(permissions).size === permissions.length),
+    deniedPermissions: z
+      .array(z.string().regex(/^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/))
+      .max(128)
       .refine((permissions) => new Set(permissions).size === permissions.length)
+      .default([])
   })
 });
 
@@ -83,6 +89,26 @@ export type AIConfiguration = z.output<typeof aiConfigurationSchema>;
 
 export type HostConfiguration = z.output<typeof hostConfigurationSchema>;
 
+export interface EffectivePermissions {
+  readonly grantedPermissions: readonly string[];
+  readonly deniedPermissions: readonly string[];
+}
+
+/** Resolves installation-owned grants and denials; requests and providers are not inputs. */
+export class PermissionResolver {
+  constructor(
+    private readonly allow: readonly string[],
+    private readonly deny: readonly string[] = []
+  ) {}
+
+  resolve(_channel: Channel, _environment: "development" | "production"): EffectivePermissions {
+    return {
+      grantedPermissions: this.allow.filter((permission) => !this.deny.includes(permission)),
+      deniedPermissions: this.deny
+    };
+  }
+}
+
 export function loadHostConfiguration(
   environment: Readonly<Record<string, string | undefined>>
 ): HostConfiguration {
@@ -102,7 +128,14 @@ export function loadHostConfiguration(
               .filter(Boolean)
           : environment["NODE_ENV"] === "production"
             ? defaults.tools.grantedPermissions
-            : defaults.tools.developmentGrantedPermissions
+            : defaults.tools.developmentGrantedPermissions,
+      deniedPermissions:
+        environment["GEORGE_TOOL_DENY_PERMISSIONS"] !== undefined
+          ? environment["GEORGE_TOOL_DENY_PERMISSIONS"]
+              .split(",")
+              .map((permission) => permission.trim())
+              .filter(Boolean)
+          : []
     }
   });
   if (!result.success) {

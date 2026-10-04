@@ -1,10 +1,21 @@
 import { Injectable, inject, signal } from "@angular/core";
 import type { AgentEvent } from "@george/protocol";
-import type { AIProviderInfo, AIProviderStatus } from "@george/protocol";
+import type {
+  AIProviderInfo,
+  AIProviderStatus,
+  ApprovalRequest,
+  AgentResponse
+} from "@george/protocol";
 import { AgentApiService } from "./agent-api.service.js";
 
 export type HostConnectionState = "CONNECTING" | "ONLINE" | "OFFLINE";
 export type AgentDisplayState = "READY" | "THINKING" | "EXECUTING" | "WAITING_APPROVAL" | "ERROR";
+export function isApprovalActionDisabled(
+  status: ApprovalRequest["status"],
+  resolving: boolean
+): boolean {
+  return status !== "PENDING" || resolving;
+}
 export function mapAIStatus(info: AIProviderInfo | null): AIProviderStatus | "UNKNOWN" {
   return info?.status ?? "UNKNOWN";
 }
@@ -24,6 +35,8 @@ export function safeAgentError(code: string): string {
       return "El modelo configurado no puede solicitar herramientas.";
     case "TOOL_RESULT_TOO_LARGE":
       return "El resultado de la herramienta excedió el límite permitido.";
+    case "AUDIT_WRITE_FAILED":
+      return "La acción pudo ejecutarse, pero George no pudo guardarla en la auditoría.";
     default:
       return "George no pudo completar la solicitud.";
   }
@@ -100,12 +113,15 @@ export class AgentFacade {
   readonly busy = signal(false);
   readonly messages = signal<readonly ChatMessage[]>([]);
   readonly activity = signal<readonly ActivityItem[]>([]);
+  readonly approvals = signal<readonly ApprovalRequest[]>([]);
+  readonly resolvingApprovals = signal<readonly string[]>([]);
   readonly conversationId = crypto.randomUUID();
   #eventSource: EventSource | undefined;
 
   async connect(): Promise<void> {
     try {
       await this.#api.bootstrapSession();
+      await this.refreshApprovals();
       const source = new EventSource("/api/v1/agent/events");
       this.#eventSource = source;
       source.onopen = () => this.connection.set("ONLINE");
@@ -146,6 +162,7 @@ export class AgentFacade {
         this.agentState.set("READY");
       } else if (response.status === "approval_required") {
         this.agentState.set("WAITING_APPROVAL");
+        await this.refreshApprovals();
         this.messages.update((messages) => [
           ...messages,
           {
@@ -184,6 +201,40 @@ export class AgentFacade {
     }
   }
 
+  async refreshApprovals(): Promise<void> {
+    try {
+      this.approvals.set(await this.#api.getApprovals());
+    } catch {
+      this.approvals.set([]);
+    }
+  }
+
+  async resolveApproval(approvalId: string, decision: "approve" | "deny"): Promise<void> {
+    if (this.resolvingApprovals().includes(approvalId)) return;
+    this.agentState.set(decision === "approve" ? "EXECUTING" : "READY");
+    this.resolvingApprovals.update((ids) => [...ids, approvalId]);
+    try {
+      const response = await this.#api.resolveApproval(approvalId, decision);
+      this.#applyApprovalResponse(response);
+      await this.refreshApprovals();
+    } catch (error) {
+      if (error instanceof Error && error.message === "APPROVAL_EXPIRED") {
+        this.approvals.update((items) =>
+          items.map((item) =>
+            item.approvalId === approvalId ? { ...item, status: "EXPIRED" } : item
+          )
+        );
+      }
+      if (
+        error instanceof Error &&
+        ["APPROVAL_RESOLVED", "APPROVAL_NOT_FOUND"].includes(error.message)
+      )
+        await this.refreshApprovals();
+    } finally {
+      this.resolvingApprovals.update((ids) => ids.filter((id) => id !== approvalId));
+    }
+  }
+
   close(): void {
     this.#eventSource?.close();
     this.#eventSource = undefined;
@@ -209,5 +260,25 @@ export class AgentFacade {
         }
       ].slice(-40)
     );
+  }
+
+  #applyApprovalResponse(response: AgentResponse): void {
+    if (response.status === "approval_required") {
+      this.agentState.set("WAITING_APPROVAL");
+      return;
+    }
+    if (response.status === "completed") {
+      this.messages.update((items) => [
+        ...items,
+        { id: response.requestId, role: "assistant", content: response.content }
+      ]);
+      this.agentState.set("READY");
+      return;
+    }
+    this.messages.update((items) => [
+      ...items,
+      { id: response.requestId, role: "assistant", content: safeAgentError(response.error.code) }
+    ]);
+    this.agentState.set(response.status === "denied" ? "READY" : "ERROR");
   }
 }

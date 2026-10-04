@@ -309,6 +309,51 @@ input {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.approval-card {
+  width: min(100%, 640px);
+  margin: 0 auto 16px;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border: 1px solid #8a6d34;
+  border-radius: 8px;
+  background: #211d13;
+}
+.approval-card h2 {
+  margin: 4px 0 8px;
+  font-size: 16px;
+}
+.approval-card p {
+  margin: 4px 0;
+  font-size: 12px;
+}
+.approval-card small {
+  color: #c4b78f;
+  font: 9px var(--mono);
+}
+.approval-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.approval-actions button {
+  border: 1px solid #7e714c;
+  border-radius: 5px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: #302a1c;
+  cursor: pointer;
+}
+.approval-actions button:last-child {
+  border-color: #72a28d;
+  background: #244137;
+}
+.approval-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 .composer {
   display: flex;
   align-items: center;

@@ -15,13 +15,15 @@
     "@george/ai": "workspace:*",
     "@george/config": "workspace:*",
     "@george/core": "workspace:*",
-    "@george/protocol": "workspace:*",
     "@george/policy": "workspace:*",
+    "@george/protocol": "workspace:*",
     "@george/tools-core": "workspace:*",
+    "better-sqlite3": "13.0.3",
     "fastify": "5.12.5"
   },
   "devDependencies": {
-    "tsx": "4.23.15",
-    "rimraf": "6.0.1"
+    "@types/better-sqlite3": "9.6.0",
+    "rimraf": "6.0.1",
+    "tsx": "4.23.15"
   }
 }

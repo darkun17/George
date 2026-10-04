@@ -5,6 +5,7 @@ export interface PolicyRequest {
   readonly riskLevel: RiskLevel;
   readonly requiredPermissions: readonly string[];
   readonly grantedPermissions: readonly string[];
+  readonly deniedPermissions?: readonly string[];
 }
 
 export interface PolicyEngine {
@@ -13,6 +14,12 @@ export interface PolicyEngine {
 
 export class DefaultPolicyEngine implements PolicyEngine {
   evaluate(request: PolicyRequest): PolicyDecision {
+    const explicitlyDenied = request.requiredPermissions.filter((permission) =>
+      request.deniedPermissions?.includes(permission)
+    );
+    if (explicitlyDenied.length > 0) {
+      return { outcome: "DENY", reason: "Required permissions are explicitly denied." };
+    }
     if (request.riskLevel === "CRITICAL") {
       return { outcome: "DENY", reason: "Critical-risk tools are denied by default." };
     }
