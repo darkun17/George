@@ -1,12 +1,17 @@
+import "@angular/compiler";
 import { describe, expect, it } from "vitest";
+import { Injector, runInInjectionContext } from "@angular/core";
 import type { AgentEvent } from "@george/protocol";
 import {
+  AgentFacade,
   activityLabel,
+  describeApiFailure,
   isApprovalActionDisabled,
   mapAIStatus,
   reduceAgentState,
   safeAgentError
 } from "./agent-facade.service.js";
+import { AgentApiError, AgentApiService } from "./agent-api.service.js";
 
 const event = (type: AgentEvent["type"]): AgentEvent =>
   ({
@@ -91,5 +96,72 @@ describe("agent activity presentation", () => {
     expect(isApprovalActionDisabled("APPROVED", false)).toBe(true);
     expect(isApprovalActionDisabled("DENIED", false)).toBe(true);
     expect(reduceAgentState("WAITING_APPROVAL", event("request.completed"))).toBe("READY");
+  });
+});
+
+describe("describeApiFailure", () => {
+  it("maps a network failure to a Host-unreachable message, distinct from a security rejection", () => {
+    expect(describeApiFailure(new AgentApiError("NETWORK", "boom"))).toBe(
+      "George Host no está disponible."
+    );
+    expect(describeApiFailure(new AgentApiError("HTTP", "x", 401))).toBe(
+      "La sesión local no es válida."
+    );
+    expect(describeApiFailure(new AgentApiError("HTTP", "x", 403))).toBe(
+      "George rechazó la solicitud por seguridad."
+    );
+    expect(describeApiFailure(new AgentApiError("HTTP", "x", 503))).toBe(
+      "El proveedor de IA no está disponible."
+    );
+    expect(describeApiFailure(new AgentApiError("HTTP", "x", 500))).toBe(
+      "George no pudo procesar la solicitud."
+    );
+    expect(describeApiFailure(new Error("unrelated"))).toBe(
+      "George no pudo procesar la solicitud."
+    );
+  });
+});
+
+function createFacade(api: Partial<AgentApiService>): AgentFacade {
+  const injector = Injector.create({
+    providers: [AgentFacade, { provide: AgentApiService, useValue: api }]
+  });
+  return runInInjectionContext(injector, () => injector.get(AgentFacade));
+}
+
+describe("AgentFacade.send error classification (N, O, P)", () => {
+  it("N. a 403 security rejection surfaces as a security message, not a connectivity failure", async () => {
+    const facade = createFacade({
+      send: async () => {
+        throw new AgentApiError("HTTP", "La solicitud no superó la validación CSRF.", 403);
+      }
+    });
+    facade.connection.set("ONLINE");
+    await facade.send("hola");
+    expect(facade.messages().at(-1)?.content).toBe("George rechazó la solicitud por seguridad.");
+    expect(facade.agentState()).toBe("ERROR");
+  });
+
+  it("O. an actual network failure surfaces as Host-unavailable", async () => {
+    const facade = createFacade({
+      send: async () => {
+        throw new AgentApiError("NETWORK", "fetch failed");
+      }
+    });
+    facade.connection.set("ONLINE");
+    await facade.send("hola");
+    expect(facade.messages().at(-1)?.content).toBe("George Host no está disponible.");
+  });
+
+  it("P. Host ONLINE remains ONLINE after an Agent 403 (connection and agent state stay separate)", async () => {
+    const facade = createFacade({
+      send: async () => {
+        throw new AgentApiError("HTTP", "denied", 403);
+      }
+    });
+    facade.connection.set("ONLINE");
+    await facade.send("hola");
+    expect(facade.connection()).toBe("ONLINE");
+    expect(facade.agentState()).toBe("ERROR");
   });
 });

@@ -57,6 +57,22 @@ function expectedOrigins(
   return origins;
 }
 
+/**
+ * Logs the safe rejection reason for a protected request without ever logging the
+ * cookie, session token, CSRF token, or any header/body value that produced the
+ * rejection. The HTTP response body already carries the same safe code to the caller.
+ */
+function rejectRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  statusCode: number,
+  code: "ORIGIN_REJECTED" | "SESSION_REQUIRED" | "CSRF_REJECTED",
+  message: string
+): FastifyReply {
+  request.log.warn({ requestId: request.id, code }, "George rejected a protected request");
+  return reply.code(statusCode).send({ error: { code, message } });
+}
+
 function setSecurityHeaders(reply: { header: (name: string, value: string) => unknown }): void {
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "no-referrer");
@@ -194,9 +210,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   app.get("/api/v1/ai/status", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return aiProvider.management.getInfo();
@@ -205,9 +219,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   app.get("/api/v1/ai/models", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     try {
@@ -225,9 +237,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
   app.get("/api/v1/tools", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return { tools: toolRegistry.listMetadata() };
@@ -242,15 +252,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookie = request.headers.cookie;
     if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     reply.header("Cache-Control", "no-store");
     return { approvals: approvalStore.list() };
@@ -265,15 +271,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookie = request.headers.cookie;
     if (!getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     const query =
       request.query && typeof request.query === "object"
@@ -291,20 +293,20 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     decision: "approve" | "deny"
   ) => {
     if (!validateOrigin(request.headers.origin))
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     const cookie = request.headers.cookie;
     const session = getSession(Array.isArray(cookie) ? cookie.join("; ") : cookie);
     if (!session)
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     const csrf = request.headers["x-george-csrf"];
     if (!sessions.validateCsrf(session, Array.isArray(csrf) ? csrf[0] : csrf))
-      return reply.code(403).send({
-        error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-      });
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
     reply.header("Cache-Control", "no-store");
     const result =
       decision === "approve"
@@ -352,24 +354,24 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     Body: { input?: unknown; conversationId?: unknown };
   }>("/api/v1/tools/:id/execute", async (request, reply) => {
     if (!validateOrigin(request.headers.origin)) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookieHeader = request.headers.cookie;
     const session = getSession(
       Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
     );
     if (!session) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     const csrfHeader = request.headers["x-george-csrf"];
     if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
-      return reply.code(403).send({
-        error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-      });
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
     }
     const body = request.body;
     const validOptionalId = (value: unknown): value is string | undefined =>
@@ -423,9 +425,7 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 
   app.post("/api/v1/session/bootstrap", async (request, reply) => {
     if (!validateOrigin(request.headers.origin)) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const session = sessions.create(request.ip);
     if (!session) {
@@ -445,24 +445,24 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     "/api/v1/agent/requests",
     async (request, reply) => {
       if (!validateOrigin(request.headers.origin)) {
-        return reply
-          .code(403)
-          .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+        return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
       }
       const cookieHeader = request.headers.cookie;
       const session = getSession(
         Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
       );
       if (!session) {
-        return reply
-          .code(401)
-          .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+        return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
       }
       const csrfHeader = request.headers["x-george-csrf"];
       if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
-        return reply.code(403).send({
-          error: { code: "CSRF_REJECTED", message: "La solicitud no superó la validación CSRF." }
-        });
+        return rejectRequest(
+          request,
+          reply,
+          403,
+          "CSRF_REJECTED",
+          "La solicitud no superó la validación CSRF."
+        );
       }
       const body = request.body;
       if (
@@ -528,15 +528,11 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         request.headers.host
       )
     ) {
-      return reply
-        .code(403)
-        .send({ error: { code: "ORIGIN_REJECTED", message: "Origen no permitido." } });
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
     }
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
-      return reply
-        .code(401)
-        .send({ error: { code: "SESSION_REQUIRED", message: "Inicia una sesión local." } });
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
     }
     if (sseResponses.size >= 8) {
       return reply.code(429).send({
@@ -573,7 +569,13 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 
   const webRoot = options.webRoot ?? new URL("../../web/dist/browser/", import.meta.url);
   const resolvedWebRoot = webRoot instanceof URL ? fileURLToPath(webRoot) : webRoot;
-  if (options.serveWeb !== false && existsSync(resolvedWebRoot)) {
+  // A compiled apps/web/dist left over from `pnpm build` must not turn Host into a second,
+  // concurrently-reachable UI origin while the Angular dev server is also running: browser
+  // cookies are host-scoped, not port-scoped, so bootstrapping a session on each origin would
+  // silently overwrite the other's session and orphan its cached CSRF token (CSRF_REJECTED).
+  // Outside production this static mount is opt-in only.
+  const serveWeb = options.serveWeb ?? environment["NODE_ENV"] === "production";
+  if (serveWeb && existsSync(resolvedWebRoot)) {
     await app.register(fastifyStatic, {
       root: resolvedWebRoot,
       prefix: "/",

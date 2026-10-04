@@ -568,3 +568,183 @@ describe("George Host HTTP boundary", () => {
     expect(executionCount).toBe(0);
   });
 });
+
+describe("trusted Origin policy (default, environment-driven)", () => {
+  const DEFAULT_PORT = 43100;
+  const HOST_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
+  const DEV_ORIGIN = "http://127.0.0.1:4200";
+
+  async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
+    const server = await buildHostServer({ environment, serveWeb: false });
+    servers.push(server);
+    return server.app;
+  }
+
+  async function postAgentRequest(app: FastifyInstance, origin: string | undefined) {
+    return app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: origin !== undefined ? { origin } : {},
+      payload: { conversationId: "c", input: "hola" }
+    });
+  }
+
+  it("A. accepts the Host's own origin in production", async () => {
+    const app = await createEnvServer({ NODE_ENV: "production" });
+    const response = await postAgentRequest(app, HOST_ORIGIN);
+    expect(response.statusCode).not.toBe(403);
+  });
+
+  it("B. accepts the Angular dev origin outside production", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, DEV_ORIGIN);
+    expect(response.statusCode).not.toBe(403);
+  });
+
+  it("C. rejects the Angular dev origin in production", async () => {
+    const app = await createEnvServer({ NODE_ENV: "production" });
+    const response = await postAgentRequest(app, DEV_ORIGIN);
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("D. rejects an arbitrary untrusted localhost port", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "http://127.0.0.1:5555");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("E. does not treat localhost and 127.0.0.1 as equivalent", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "http://localhost:4200");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("F. rejects a malicious external origin", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "https://evil.example.com");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("G. rejects a malformed Origin header without throwing", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, "not-a-valid-origin");
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("H. rejects a mutating request with a missing Origin header", async () => {
+    const app = await createEnvServer({});
+    const response = await postAgentRequest(app, undefined);
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "ORIGIN_REJECTED" } });
+  });
+
+  it("never mounts the compiled web build by default outside production", async () => {
+    // Regression guard for the dual-origin session collision: Host must not become a second
+    // UI entry point unless explicitly asked (serveWeb: true) or running in production, even
+    // when apps/web/dist exists on disk from a previous `pnpm build`.
+    const server = await buildHostServer({ environment: {}, origins: [DEV_ORIGIN] });
+    servers.push(server);
+    const response = await server.app.inject({ method: "GET", url: "/", headers: {} });
+    expect(response.statusCode).toBe(404);
+  });
+});
+
+describe("session/CSRF lifecycle (I-M, and the dual-origin collision regression)", () => {
+  async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
+    const server = await buildHostServer({ environment, origins: [ORIGIN], serveWeb: false });
+    servers.push(server);
+    return server.app;
+  }
+
+  it("I. rejects a mutating request with no session cookie", async () => {
+    const app = await createEnvServer({});
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "SESSION_REQUIRED" } });
+  });
+
+  it("J. rejects a mutating request with an invalid/garbage session cookie", async () => {
+    const app = await createEnvServer({});
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: "george_session=not-a-real-session" },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "SESSION_REQUIRED" } });
+  });
+
+  it("K. rejects a mutating request with a valid session but no CSRF header", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+
+  it("L. rejects a mutating request with an invalid CSRF token", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": "wrong-token" },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+
+  it("M. valid session + valid CSRF + trusted dev Origin succeeds", async () => {
+    const app = await createEnvServer({});
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: "completed" });
+  });
+
+  it("reproduces the root cause: a second origin's bootstrap orphans the first origin's CSRF token", async () => {
+    // This is the exact mechanism behind the reported dev-mode 403: browser cookies are
+    // host-scoped, not port-scoped, so when a second trusted origin (e.g. Host's own static
+    // UI at 43100) bootstraps on the same host, it silently overwrites the shared
+    // george_session cookie. The first origin's in-memory CSRF token is now stale and must
+    // be rejected -- CSRF enforcement is working as designed, not broken.
+    const app = await createEnvServer({});
+    const first = await bootstrap(app); // tab/origin A's session + CSRF
+    const second = await bootstrap(app); // tab/origin B re-bootstraps on the shared host cookie
+
+    const staleRequest = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      // The real browser's cookie jar is host-scoped, not port-scoped: a single
+      // `george_session` cookie exists for 127.0.0.1, and the most recent bootstrap (B)
+      // is what it now holds and auto-attaches -- while origin A's JS still has its own
+      // original CSRF token cached in memory from its own earlier bootstrap.
+      headers: { origin: ORIGIN, cookie: second.cookie!, "x-george-csrf": first.csrfToken },
+      payload: { conversationId: "c", input: "hola" }
+    });
+    expect(staleRequest.statusCode).toBe(403);
+    expect(staleRequest.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+});

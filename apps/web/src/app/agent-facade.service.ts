@@ -6,7 +6,7 @@ import type {
   ApprovalRequest,
   AgentResponse
 } from "@george/protocol";
-import { AgentApiService } from "./agent-api.service.js";
+import { AgentApiError, AgentApiService } from "./agent-api.service.js";
 
 export type HostConnectionState = "CONNECTING" | "ONLINE" | "OFFLINE";
 export type AgentDisplayState = "READY" | "THINKING" | "EXECUTING" | "WAITING_APPROVAL" | "ERROR";
@@ -19,6 +19,29 @@ export function isApprovalActionDisabled(
 export function mapAIStatus(info: AIProviderInfo | null): AIProviderStatus | "UNKNOWN" {
   return info?.status ?? "UNKNOWN";
 }
+/**
+ * Classifies an AgentApiService failure into a safe, user-facing message.
+ * A network failure (Host unreachable) and a Host-issued security rejection
+ * (401/403) are different situations and must never collapse into the same
+ * "cannot connect" message.
+ */
+export function describeApiFailure(error: unknown): string {
+  if (error instanceof AgentApiError) {
+    if (error.kind === "NETWORK") return "George Host no está disponible.";
+    switch (error.status) {
+      case 401:
+        return "La sesión local no es válida.";
+      case 403:
+        return "George rechazó la solicitud por seguridad.";
+      case 503:
+        return "El proveedor de IA no está disponible.";
+      default:
+        return "George no pudo procesar la solicitud.";
+    }
+  }
+  return "George no pudo procesar la solicitud.";
+}
+
 export function safeAgentError(code: string): string {
   switch (code) {
     case "PROVIDER_UNAVAILABLE":
@@ -182,18 +205,14 @@ export class AgentFacade {
           }
         ]);
       }
-    } catch {
+    } catch (error) {
       this.agentState.set("ERROR");
-      const providerUnavailable =
-        this.aiInfo()?.status === "UNAVAILABLE" || this.aiInfo()?.status === "MISCONFIGURED";
       this.messages.update((messages) => [
         ...messages,
         {
           id: crypto.randomUUID(),
           role: "assistant",
-          content: providerUnavailable
-            ? "No se pudo conectar con el proveedor de IA configurado."
-            : "No se pudo conectar con George Host."
+          content: describeApiFailure(error)
         }
       ]);
     } finally {
