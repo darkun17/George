@@ -18,7 +18,15 @@ import {
   type AIConfiguration
 } from "@george/config";
 import { DefaultPolicyEngine } from "@george/policy";
-import { InMemoryToolRegistry, ToolRuntime, systemInfoTool } from "@george/tools-core";
+import {
+  ApplicationRegistry,
+  InMemoryToolRegistry,
+  ToolRuntime,
+  createAppsListTool,
+  createAppsOpenTool,
+  systemInfoTool,
+  systemProcessListTool
+} from "@george/tools-core";
 import { SessionStore, readSessionCookie } from "./session-store.js";
 import { SseAgentEventSink } from "./sse-event-sink.js";
 import { PendingApprovalStore } from "./pending-approval-store.js";
@@ -162,8 +170,12 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
       ? new InMemoryAuditSink()
       : new SqliteAuditSink(options.auditDatabasePath ?? getAuditDatabasePath(environment)));
   const approvalStore = options.approvalStore ?? new PendingApprovalStore(auditSink);
+  const applicationRegistry = new ApplicationRegistry(environment);
   const toolRegistry = new InMemoryToolRegistry();
   toolRegistry.register(systemInfoTool);
+  toolRegistry.register(createAppsListTool(applicationRegistry));
+  toolRegistry.register(createAppsOpenTool(applicationRegistry));
+  toolRegistry.register(systemProcessListTool);
   const toolRuntime = new ToolRuntime({
     registry: toolRegistry,
     policyEngine: new DefaultPolicyEngine(),

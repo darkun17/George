@@ -122,3 +122,53 @@ checks the selected model's advertised `tools` capability via `/api/show`; missi
 metadata fails closed. A supported model may still return an ordinary final message, in which case
 no tool runs. Ollama calls time out at 120 seconds, ToolRuntime calls are capped at 120 seconds, and
 Host cancels the whole Agent request after 130 seconds.
+
+## M5 Approval, permission, and persistent audit
+
+The approval state machine (`PENDING → APPROVED | DENIED | EXPIRED`) lives entirely in Host process
+memory (`PendingApprovalStore`); it is bounded, has a TTL (default 5 minutes, capped), and resolves
+exactly once under concurrent approve/deny calls. An approval binds the exact tool id, tool-call id,
+and validated input captured at ASK time (`ToolApprovalHandle`); resuming it re-resolves permissions
+and re-evaluates policy before the handler runs, so DENY and a missing permission still win even with
+a valid approval id. Restart invalidates all pending approvals and Agent continuations -- neither is
+persisted. Audit is durable (SQLite, outside the repository, see `getAppDataDir`) and never stores
+prompts, Tool input/output, or secrets; pre-execution audit failure fails closed, post-execution
+failure is represented honestly rather than claiming the Tool did not run.
+
+## M5.0.1 Development transport hotfixes
+
+Two dev-only issues were fixed without touching the security model: (1) a stale `apps/web/dist` made
+Host mount a second UI origin alongside the Angular dev server, and because `george_session` is
+host-scoped rather than port-scoped (RFC 6265), the second origin's bootstrap silently invalidated the
+first origin's cached CSRF token -- fixed by defaulting `serveWeb` to production-only, not by relaxing
+Origin/CSRF/session checks; (2) the frontend collapsed every failure (network-down, 401, 403, 5xx)
+into one generic message, which made a security rejection look identical to "Host unreachable" --
+fixed with a typed `AgentApiError` and per-status messages.
+
+## M5.0.2 Settings and George Doctor
+
+Settings are session-gated for reads and session+Origin+CSRF-gated for the mutating `PATCH
+/api/v1/settings`, identically to every other mutating route. The persisted profile
+(`<AppData>/George/settings.json`) stores only assistant name/language, display name, and AI
+provider/model selection -- never a credential value; `credentialRef` remains the only place a future
+secret reference may appear, resolved later through the planned `SecretStore`. George Doctor
+(`GET /api/v1/doctor`, session-gated) performs real checks against the live provider, session store,
+pending-approval count, and an actual `SqliteAuditSink.recent()` probe; it never exposes environment
+variables, raw filesystem internals, or any token/cookie value.
+
+## M5.1 First desktop actions threat review
+
+| Threat                                                        | Impact                                           | Mitigation                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Model-chosen arbitrary executable path or command string      | Arbitrary code execution                         | `apps.open` only accepts a trusted `applicationId` (Zod `.strict()`); the AI can never supply or influence a filesystem path, flag, or shell operator. `ApplicationRegistry` resolves the id to a path from a short, curated candidate list and spawns with `shell: false` and no arguments.                                                                 |
+| Recursive or broad filesystem search for an "application"     | Information disclosure, slow/expensive discovery | Discovery checks only a fixed small list of well-known install locations per application id (e.g. VS Code under `%LOCALAPPDATA%`/`Program Files`); it never walks a directory tree or searches a drive.                                                                                                                                                      |
+| Silent/implicit execution of a HIGH-risk action               | Unapproved desktop action                        | `apps.open` is `riskLevel: "HIGH"`; `DefaultPolicyEngine` returns `ASK` whenever the permission is granted, requiring one-time human approval through the existing M5 approval pipeline before the first spawn attempt. The permission itself (`apps.open.execute`) is granted only in development defaults, never in production, by `george.defaults.json`. |
+| Approval card not explaining what will happen                 | Humans approving blind                           | `ToolDefinition.describeForApproval` lets trusted tool code (never the model, never raw input echoed) build a short label ("Abrir Visual Studio Code") from the validated, registry-resolved application; threaded through `ToolRuntime` → `AgentRuntime` → `PendingApprovalStore` as `ApprovalRequest.summary`, a new _optional_ safe-metadata field.       |
+| Process-list output leaking command-line secrets              | Credential/token disclosure                      | `system.process.list` spawns the fixed `tasklist.exe` with fixed flags (`/fo csv /nh`, `shell: false`) and parses only Image Name + PID columns; the full command line is never requested from the OS, so it cannot leak even by a parsing bug. Output is capped at 200 processes.                                                                           |
+| Orphaned/zombie child process from a failed or cancelled open | Resource leak                                    | The spawned process is `detached` + `unref()`'d so it cannot block Host shutdown or the Agent response; `system.process.list`'s own child is killed on timeout or the caller's `AbortSignal`, both covered by a dedicated test.                                                                                                                              |
+| Unbounded process-list output                                 | Memory/response exhaustion                       | Capped at 200 entries (`MAX_PROCESSES`); a `truncated` flag is returned instead of silently dropping data without saying so.                                                                                                                                                                                                                                 |
+
+No tool in this milestone can write to the filesystem, execute a shell, or accept user-influenced
+arguments of any kind; `apps.open` and `system.process.list` are the only two capabilities with any
+system-level effect, and both pass through the same ToolRuntime → PolicyEngine → Approval → Audit
+pipeline as every other tool. Production has no implicit grant for either.

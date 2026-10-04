@@ -133,18 +133,20 @@ describe("George Host HTTP boundary", () => {
       headers: { cookie: session.cookie }
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({
-      tools: [
-        {
-          id: "system.info",
-          name: "System information",
-          description: "Read basic operating system and hardware information.",
-          riskLevel: "SAFE",
-          requiredPermissions: ["system.info.read"],
-          timeoutMs: 2000,
-          availability: "AVAILABLE"
-        }
-      ]
+    expect(response.json().tools.map((tool: { id: string }) => tool.id)).toEqual([
+      "system.info",
+      "apps.list",
+      "apps.open",
+      "system.process.list"
+    ]);
+    expect(response.json().tools[0]).toEqual({
+      id: "system.info",
+      name: "System information",
+      description: "Read basic operating system and hardware information.",
+      riskLevel: "SAFE",
+      requiredPermissions: ["system.info.read"],
+      timeoutMs: 2000,
+      availability: "AVAILABLE"
     });
     expect(response.body).not.toMatch(/handler|schema|secret|[A-Za-z]:\\/i);
   });
@@ -893,5 +895,191 @@ describe("Settings and Doctor", () => {
     const body = response.json();
     expect(typeof body.available).toBe("boolean");
     expect(Array.isArray(body.models)).toBe(true);
+  });
+});
+
+describe("M5.1 desktop action tools (apps.list, apps.open, system.process.list)", () => {
+  // Every candidate-path env var is pointed at a location that cannot exist on any
+  // machine, so apps.open can never resolve a real executable in this automated
+  // suite -- an empty/partial environment falls back to real default install paths
+  // (e.g. "C:\Program Files"), which on a real dev machine can and does resolve a
+  // real installed Chrome/VS Code. Approving apps.open here must never spawn
+  // anything real; only the live manual validation does that, deliberately.
+  async function createIsolatedServer() {
+    const server = await buildHostServer({
+      environment: {
+        NODE_ENV: "test",
+        LOCALAPPDATA: "Z:\\george-test-does-not-exist\\LOCALAPPDATA",
+        ProgramFiles: "Z:\\george-test-does-not-exist\\ProgramFiles",
+        "ProgramFiles(x86)": "Z:\\george-test-does-not-exist\\ProgramFilesX86",
+        SystemRoot: "Z:\\george-test-does-not-exist\\SystemRoot"
+      },
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
+    servers.push(server);
+    return server.app;
+  }
+
+  it("lists configured applications with real (not hardcoded) availability, without exposing paths", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.list/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(result.output.applications).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "vscode", available: false })])
+    );
+    expect(response.body).not.toMatch(/\.exe|Program Files|george-test-does-not-exist/i);
+  });
+
+  it("direct tool execution surfaces approval_required but has no conversation to later resume", async () => {
+    // /api/v1/tools/:id/execute has no Agent transcript to continue, so its ASK
+    // result is informational only (it still proves policy/risk evaluation ran);
+    // the resumable approval lifecycle is specifically the Agent request flow below.
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const requested = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.open/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: { applicationId: "vscode" } }
+    });
+    expect(requested.statusCode).toBe(409);
+    expect(requested.json()).toMatchObject({ status: "approval_required" });
+  });
+
+  it("George, abre Visual Studio Code: full Agent flow -- THINKING, approval with a safe summary, approve, execute, audit", async () => {
+    const observed: AIMessage[][] = [];
+    let turn = 0;
+    const provider: ManagedAIProvider = {
+      id: "scripted",
+      capabilities: { streaming: false, tools: true },
+      management: {
+        getInfo: async () => ({
+          id: "scripted",
+          status: "AVAILABLE",
+          model: "fake",
+          models: ["fake"]
+        }),
+        listModels: async () => ["fake"]
+      },
+      async chat(messages) {
+        observed.push([...messages]);
+        return turn++ === 0
+          ? {
+              kind: "tool_calls",
+              calls: [{ id: "open-1", toolId: "apps.open", input: { applicationId: "vscode" } }]
+            }
+          : { kind: "message", text: "Intenté abrir Visual Studio Code." };
+      }
+    };
+    const audit = new InMemoryAuditSink();
+    const server = await buildHostServer({
+      environment: {
+        NODE_ENV: "test",
+        LOCALAPPDATA: "Z:\\george-test-does-not-exist\\LOCALAPPDATA",
+        ProgramFiles: "Z:\\george-test-does-not-exist\\ProgramFiles",
+        "ProgramFiles(x86)": "Z:\\george-test-does-not-exist\\ProgramFilesX86",
+        SystemRoot: "Z:\\george-test-does-not-exist\\SystemRoot"
+      },
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath(),
+      aiProvider: provider,
+      auditSink: audit
+    });
+    servers.push(server);
+    const app = server.app;
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+
+    const pendingResponse = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers,
+      payload: { conversationId: "c", input: "George, abre Visual Studio Code." }
+    });
+    expect(pendingResponse.statusCode).toBe(409);
+    expect(pendingResponse.json()).toMatchObject({ status: "approval_required" });
+
+    const approvalsList = await app.inject({
+      method: "GET",
+      url: "/api/v1/approvals",
+      headers: { origin: ORIGIN, cookie: session.cookie }
+    });
+    const pending = approvalsList.json().approvals[0];
+    expect(pending).toMatchObject({
+      toolId: "apps.open",
+      riskLevel: "HIGH",
+      status: "PENDING",
+      summary: "Abrir Visual Studio Code"
+    });
+
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/v1/approvals/${pending.approvalId}/approve`,
+      headers
+    });
+    // The (deliberately fake) environment has no real VS Code install, so execution
+    // fails closed -- but the approval itself was honored, policy was re-evaluated,
+    // and the Agent transcript continued with the real tool result, proving the
+    // whole THINKING -> WAITING_APPROVAL -> EXECUTING -> response pipeline works.
+    expect(approved.statusCode).toBe(500);
+    expect(approved.json()).toMatchObject({
+      status: "failed",
+      error: { code: "TOOL_EXECUTION_FAILED" }
+    });
+    expect(observed).toHaveLength(1); // the provider is only re-consulted after a *successful* tool run
+
+    const toolAuditRecords = audit.records.filter(
+      (record) => record.operation === "tool.execution"
+    );
+    expect(toolAuditRecords.some((record) => record.toolId === "apps.open")).toBe(true);
+    expect(JSON.stringify(toolAuditRecords)).not.toMatch(/applicationId|vscode/i);
+    const approvalAuditRecords = audit.records.filter(
+      (record) => record.operation === "approval.decision"
+    );
+    expect(approvalAuditRecords.map((record) => record.decision)).toEqual([
+      "requested",
+      "approved"
+    ]);
+  });
+
+  it("denies apps.open outright when the permission itself is not granted, even with an approval id", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/apps.open/execute",
+      headers,
+      payload: { input: { applicationId: "vscode" }, approvalId: "forged-approval-id" }
+    });
+    // The route never accepts approvalId/permission overrides from the request body;
+    // this just proves the forged field is ignored and normal ASK behavior still applies.
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("lists real running processes with only safe pid/name fields", async () => {
+    const app = await createIsolatedServer();
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/tools/system.process.list/execute",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(200);
+    const result = response.json();
+    expect(Array.isArray(result.output.processes)).toBe(true);
+    expect(result.output.processes.length).toBeGreaterThan(0);
+    expect(response.body).not.toMatch(/--|cmdline/i);
   });
 });

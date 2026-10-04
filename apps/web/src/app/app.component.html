@@ -85,7 +85,7 @@
           <section class="approval-card" aria-label="Aprobación requerida">
             <div>
               <p class="eyebrow">GEORGE NECESITA AUTORIZACIÓN</p>
-              <h2>Permitir una acción</h2>
+              <h2>{{ approval.summary ?? "Permitir una acción" }}</h2>
               <p>
                 Herramienta: <strong>{{ approval.toolId }}</strong>
               </p>

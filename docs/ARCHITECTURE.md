@@ -258,9 +258,33 @@ authorization decisions.
 ## Extensibility
 
 `AIProvider` is a vendor-neutral port; provider SDKs belong in future adapters. `ToolDefinition`
-declares a runtime input schema, permissions, risk, timeout, and handler. MCP, when introduced, is
-an adapter for remote tool servers and inherits the same validation and policy boundaries. The core
-does not execute model-provided command strings.
+declares a runtime input schema, permissions, risk, timeout, and handler, plus an optional
+`describeForApproval` function that lets trusted tool code build a short, safe approval label from
+validated input (e.g. "Abrir Visual Studio Code") -- never a passthrough of raw model input, and
+surfaced to the browser only as `ApprovalRequest.summary`. MCP, when introduced, is an adapter for
+remote tool servers and inherits the same validation and policy boundaries. The core does not execute
+model-provided command strings.
+
+## Settings, Doctor, and first desktop actions (M5.0.2 / M5.1)
+
+The installation-owned assistant profile (assistant name/language, display name, AI provider and
+model selection) is validated by `@george/config`'s `assistantProfileSchema` and persisted by
+`SettingsStore` (`apps/host/src/settings-store.ts`) to `<AppData>/George/settings.json` --
+`getAppDataDir` is the single shared resolver for that directory, also used by the SQLite audit path.
+Persisted settings take priority over environment variables for AI provider/model selection, falling
+back to the env-derived configuration when the persisted selection is incomplete; switching providers
+persists immediately but takes effect on the next Host restart (no hot-swappable provider
+abstraction was introduced for this phase). George Doctor (`apps/host/src/doctor.ts`) builds a
+structured `AVAILABLE | UNAVAILABLE | MISCONFIGURED | DISABLED | NOT_INSTALLED` report per check,
+backed by real runtime state (live provider status, actual session/approval counts, an actual audit
+probe) -- voice/vision checks correctly report `NOT_INSTALLED` since those services do not exist yet.
+
+`ApplicationRegistry` (`packages/tools-core/src/application-registry.ts`) is the only place an
+`applicationId` resolves to an executable path: a short, curated list of well-known Windows install
+locations checked with `existsSync`, never a recursive or drive-wide search. `apps.open` accepts only
+a registered `applicationId`, is `riskLevel: "HIGH"`, and spawns with `shell: false` and no arguments;
+`apps.list` and `system.process.list` are read-only. All three are ordinary `ToolDefinition`s running
+through the same `ToolRuntime` → `PolicyEngine` → Approval → Audit pipeline as `system.info`.
 
 ## Platform and package rules
 

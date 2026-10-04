@@ -14,6 +14,7 @@ export interface PendingApprovalInput {
   readonly toolId: string;
   readonly riskLevel: ApprovalRequest["riskLevel"];
   readonly channel: ApprovalAuditRecord["channel"];
+  readonly summary?: string;
 }
 
 interface StoredApproval {
@@ -68,7 +69,8 @@ export class PendingApprovalStore {
       riskLevel: input.riskLevel,
       createdAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + this.#ttlMs).toISOString(),
-      status: "PENDING"
+      status: "PENDING",
+      ...(input.summary ? { summary: input.summary } : {})
     };
     const entry: StoredApproval = {
       request,
