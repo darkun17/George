@@ -4,17 +4,28 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import type { ServerResponse } from "node:http";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentRuntime, InMemoryAuditSink } from "@george/core";
 import type { AuditSink } from "@george/protocol";
-import { createAIProvider, type ManagedAIProvider } from "@george/ai";
-import { loadAIConfiguration, loadHostConfiguration, PermissionResolver } from "@george/config";
+import { createAIProvider, OllamaProvider, type ManagedAIProvider } from "@george/ai";
+import {
+  aiConfigurationSchema,
+  loadAIConfiguration,
+  loadDefaultAssistantProfile,
+  loadHostConfiguration,
+  PermissionResolver,
+  type AIConfiguration
+} from "@george/config";
 import { DefaultPolicyEngine } from "@george/policy";
 import { InMemoryToolRegistry, ToolRuntime, systemInfoTool } from "@george/tools-core";
 import { SessionStore, readSessionCookie } from "./session-store.js";
 import { SseAgentEventSink } from "./sse-event-sink.js";
 import { PendingApprovalStore } from "./pending-approval-store.js";
 import { getAuditDatabasePath, SqliteAuditSink } from "./sqlite-audit-sink.js";
+import { getAppDataDir } from "./app-data.js";
+import { SettingsStore, type SettingsPatch } from "./settings-store.js";
+import { buildDoctorReport } from "./doctor.js";
 
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
 const MAX_AGENT_INPUT_LENGTH = 4000;
@@ -30,6 +41,31 @@ export interface HostServerOptions {
   readonly auditSink?: AuditSink;
   readonly auditDatabasePath?: string;
   readonly approvalStore?: PendingApprovalStore;
+  readonly settingsStore?: SettingsStore;
+  readonly settingsPath?: string;
+}
+
+/**
+ * Builds the effective AI provider configuration: persisted settings (if any)
+ * take priority over environment variables, but fall back to the env-derived
+ * configuration whenever the persisted selection is incomplete or invalid --
+ * a stale settings file must never stop Host from starting.
+ */
+function resolveEffectiveAIConfig(
+  envConfig: AIConfiguration,
+  settingsAi: {
+    readonly provider: "mock" | "ollama";
+    readonly ollama?: { readonly model: string } | undefined;
+  }
+): AIConfiguration {
+  if (settingsAi.provider === "mock") return { provider: "mock" };
+  const baseUrl = envConfig.provider === "ollama" ? envConfig.ollama.baseUrl : undefined;
+  const candidate = {
+    provider: "ollama" as const,
+    ollama: { model: settingsAi.ollama?.model ?? "", ...(baseUrl ? { baseUrl } : {}) }
+  };
+  const parsed = aiConfigurationSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : envConfig;
 }
 
 function expectedOrigins(
@@ -91,7 +127,15 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
 }> {
   const environment = options.environment ?? process.env;
   const config = loadHostConfiguration(environment);
-  const aiConfig = loadAIConfiguration(environment);
+  const envAiConfig = loadAIConfiguration(environment);
+  const settingsStore =
+    options.settingsStore ??
+    new SettingsStore(
+      options.settingsPath ?? join(getAppDataDir(environment), "settings.json"),
+      loadDefaultAssistantProfile(environment)
+    );
+  const settings = settingsStore.get();
+  const aiConfig = resolveEffectiveAIConfig(envAiConfig, settings.ai);
   const aiProvider = options.aiProvider ?? createAIProvider(aiConfig);
   const origins = new Set(options.origins ?? expectedOrigins(config.host.port, environment));
   for (const origin of origins) {
@@ -232,6 +276,89 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
         }
       });
     }
+  });
+
+  app.get("/api/v1/ai/discover", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    const baseUrl =
+      envAiConfig.provider === "ollama" ? envAiConfig.ollama.baseUrl : "http://127.0.0.1:11434";
+    try {
+      const models = await new OllamaProvider({ baseUrl, model: "discovery-only" }).listModels();
+      return { available: true, models };
+    } catch {
+      return { available: false, models: [] };
+    }
+  });
+
+  app.get("/api/v1/settings", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    return settingsStore.get();
+  });
+
+  app.patch<{ Body: unknown }>("/api/v1/settings", async (request, reply) => {
+    if (!validateOrigin(request.headers.origin)) {
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+    }
+    const cookieHeader = request.headers.cookie;
+    const session = getSession(
+      Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+    );
+    if (!session) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    const csrfHeader = request.headers["x-george-csrf"];
+    if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
+    }
+    reply.header("Cache-Control", "no-store");
+    try {
+      const updated = settingsStore.update((request.body ?? {}) as SettingsPatch);
+      return updated;
+    } catch {
+      return reply.code(400).send({
+        error: { code: "INVALID_SETTINGS", message: "La configuración enviada no es válida." }
+      });
+    }
+  });
+
+  app.get("/api/v1/doctor", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    return buildDoctorReport({
+      aiProvider,
+      settings: settingsStore.get(),
+      sessionCount: () => sessions.count(),
+      pendingApprovalCount: () => approvalStore.list().length,
+      auditHealthy: () => {
+        if (!(auditSink instanceof SqliteAuditSink)) return true;
+        try {
+          auditSink.recent(1);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      trustedOriginCount: () => origins.size,
+      appVersion: "0.1.0",
+      dataDirectory: getAppDataDir(environment)
+    });
   });
 
   app.get("/api/v1/tools", async (request, reply) => {

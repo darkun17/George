@@ -654,3 +654,114 @@ input {
   font: 10px var(--mono, monospace);
   letter-spacing: 0.08em;
 }
+
+.settings-panel {
+  width: min(100%, 640px);
+  margin: 0 auto;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+  padding-bottom: 20px;
+}
+.settings-header h1 {
+  font-size: 22px;
+  font-weight: 500;
+  margin: 4px 0 20px;
+}
+.settings-status {
+  margin: 0 0 16px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--mint);
+  font-size: 12px;
+}
+.settings-section {
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.settings-section h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 14px;
+  letter-spacing: 0.04em;
+}
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings-field input,
+.settings-field select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 13px;
+}
+.settings-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.settings-secondary-button {
+  align-self: flex-start;
+  margin: 0 0 10px;
+  border: 1px solid #35554c;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mint);
+  padding: 7px 12px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.settings-save-button {
+  width: 100%;
+  margin-bottom: 24px;
+  border: 1px solid #35554c;
+  border-radius: 8px;
+  background: #17302b;
+  color: var(--mint);
+  padding: 11px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.settings-save-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.doctor-group {
+  margin-bottom: 16px;
+}
+.doctor-group h3 {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin: 0 0 8px;
+  text-transform: uppercase;
+}
+.doctor-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid #172224;
+  font-size: 12px;
+}
+.doctor-state {
+  font: 10px var(--mono);
+  letter-spacing: 0.05em;
+  color: #c4cdca;
+}
+.doctor-state-ok {
+  color: var(--mint);
+}
+.doctor-state-warn {
+  color: #f0a19b;
+}

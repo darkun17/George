@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AIProviderError, type ManagedAIProvider } from "@george/ai";
 import type { AIMessage, AIProviderResult, AgentResponse } from "@george/protocol";
@@ -8,6 +11,13 @@ import { PendingApprovalStore } from "./pending-approval-store.js";
 
 const ORIGIN = "http://127.0.0.1:4200";
 const servers: Array<{ app: FastifyInstance; close: () => Promise<void> }> = [];
+const temporaryDirectories: string[] = [];
+
+function temporarySettingsPath(): string {
+  const directory = mkdtempSync(join(tmpdir(), "george-settings-"));
+  temporaryDirectories.push(directory);
+  return join(directory, "settings.json");
+}
 
 async function createServer(
   aiProvider?: ManagedAIProvider,
@@ -18,6 +28,7 @@ async function createServer(
     environment: { NODE_ENV: "test" },
     origins: [ORIGIN],
     serveWeb: false,
+    settingsPath: temporarySettingsPath(),
     ...(aiProvider ? { aiProvider } : {}),
     ...(grantedPermissions ? { grantedPermissions } : {}),
     ...(approvalStore ? { approvalStore } : {})
@@ -43,6 +54,8 @@ async function bootstrap(app: FastifyInstance) {
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
+  for (const directory of temporaryDirectories.splice(0))
+    rmSync(directory, { recursive: true, force: true });
 });
 
 describe("George Host HTTP boundary", () => {
@@ -575,7 +588,11 @@ describe("trusted Origin policy (default, environment-driven)", () => {
   const DEV_ORIGIN = "http://127.0.0.1:4200";
 
   async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
-    const server = await buildHostServer({ environment, serveWeb: false });
+    const server = await buildHostServer({
+      environment,
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
     servers.push(server);
     return server.app;
   }
@@ -647,7 +664,11 @@ describe("trusted Origin policy (default, environment-driven)", () => {
     // Regression guard for the dual-origin session collision: Host must not become a second
     // UI entry point unless explicitly asked (serveWeb: true) or running in production, even
     // when apps/web/dist exists on disk from a previous `pnpm build`.
-    const server = await buildHostServer({ environment: {}, origins: [DEV_ORIGIN] });
+    const server = await buildHostServer({
+      environment: {},
+      origins: [DEV_ORIGIN],
+      settingsPath: temporarySettingsPath()
+    });
     servers.push(server);
     const response = await server.app.inject({ method: "GET", url: "/", headers: {} });
     expect(response.statusCode).toBe(404);
@@ -656,7 +677,12 @@ describe("trusted Origin policy (default, environment-driven)", () => {
 
 describe("session/CSRF lifecycle (I-M, and the dual-origin collision regression)", () => {
   async function createEnvServer(environment: Readonly<Record<string, string | undefined>>) {
-    const server = await buildHostServer({ environment, origins: [ORIGIN], serveWeb: false });
+    const server = await buildHostServer({
+      environment,
+      origins: [ORIGIN],
+      serveWeb: false,
+      settingsPath: temporarySettingsPath()
+    });
     servers.push(server);
     return server.app;
   }
@@ -746,5 +772,126 @@ describe("session/CSRF lifecycle (I-M, and the dual-origin collision regression)
     });
     expect(staleRequest.statusCode).toBe(403);
     expect(staleRequest.json()).toMatchObject({ error: { code: "CSRF_REJECTED" } });
+  });
+});
+
+describe("Settings and Doctor", () => {
+  it("requires a local session to read settings and never exposes secrets", async () => {
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/settings" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ai: { provider: "mock" } });
+    expect(response.body).not.toMatch(/credentialRef|sk-|secret/i);
+  });
+
+  it("requires Origin, session, and CSRF to update settings, then persists the change", async () => {
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const noCsrf = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: { origin: ORIGIN, cookie: session.cookie },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(noCsrf.statusCode).toBe(403);
+
+    const wrongOrigin = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: {
+        origin: "https://evil.example",
+        cookie: session.cookie,
+        "x-george-csrf": session.csrfToken
+      },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(wrongOrigin.statusCode).toBe(403);
+
+    const updated = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { assistant: { name: "Jarvis" } }
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({ assistant: { name: "Jarvis" } });
+
+    const confirm = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(confirm.json()).toMatchObject({ assistant: { name: "Jarvis" } });
+  });
+
+  it("rejects an invalid settings patch without corrupting stored settings", async () => {
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/settings",
+      headers,
+      payload: { assistant: { name: "" } }
+    });
+    expect(invalid.statusCode).toBe(400);
+    const stillValid = await app.inject({
+      method: "GET",
+      url: "/api/v1/settings",
+      headers: { cookie: session.cookie }
+    });
+    expect(stillValid.json()).toMatchObject({ assistant: { name: "George" } });
+  });
+
+  it("requires a local session for Doctor and reports real, non-hardcoded checks", async () => {
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/doctor" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/doctor",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    const report = response.json();
+    expect(report.core).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "host", state: "AVAILABLE" })])
+    );
+    expect(report.voice.every((check: { state: string }) => check.state === "NOT_INSTALLED")).toBe(
+      true
+    );
+    // "csrf" itself is a legitimate check label (Doctor reports a "csrf" check);
+    // only an actual token/cookie VALUE would be a leak.
+    expect(response.body).not.toMatch(/credentialRef|cookie=|george_session/i);
+  });
+
+  it("requires a local session for Ollama discovery and never throws regardless of reachability", async () => {
+    // Does not assert a fixed { available, models } value: whether a local Ollama
+    // happens to be running on the test machine's default port is environment state,
+    // not something this unit test should depend on (see docs/.claude/rules/testing.md).
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/ai/discover" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/ai/discover",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(typeof body.available).toBe("boolean");
+    expect(Array.isArray(body.models)).toBe(true);
   });
 });

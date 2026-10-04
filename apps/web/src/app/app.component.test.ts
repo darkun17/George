@@ -1,6 +1,10 @@
 import "@angular/compiler";
 import { describe, expect, it } from "vitest";
-import { AUTO_SCROLL_NEAR_BOTTOM_PX, shouldAutoScroll } from "./app.component.js";
+import {
+  AUTO_SCROLL_NEAR_BOTTOM_PX,
+  isNavigationItemActivatable,
+  shouldAutoScroll
+} from "./app.component.js";
 
 describe("shouldAutoScroll", () => {
   it("auto-scrolls when the viewer is already at or near the bottom", () => {
@@ -15,5 +19,19 @@ describe("shouldAutoScroll", () => {
 
   it("auto-scrolls when content does not overflow the viewport at all", () => {
     expect(shouldAutoScroll(0, 200, 400)).toBe(true);
+  });
+});
+
+describe("isNavigationItemActivatable", () => {
+  it("only activates navigation items that have real functionality", () => {
+    expect(isNavigationItemActivatable("Inicio")).toBe(true);
+    expect(isNavigationItemActivatable("Chat")).toBe(true);
+    expect(isNavigationItemActivatable("Ajustes")).toBe(true);
+  });
+
+  it("keeps not-yet-built sections disabled", () => {
+    expect(isNavigationItemActivatable("Proyectos")).toBe(false);
+    expect(isNavigationItemActivatable("Memoria")).toBe(false);
+    expect(isNavigationItemActivatable("Actividad")).toBe(false);
   });
 });

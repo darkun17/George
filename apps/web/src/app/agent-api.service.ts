@@ -39,7 +39,7 @@ async function readErrorCode(response: Response): Promise<string | undefined> {
   }
 }
 
-async function requireFetch(
+export async function requireFetch(
   url: string,
   init: RequestInit,
   fallbackMessage: string
@@ -71,6 +71,11 @@ function isAgentResponseShape(value: Record<string, unknown>): value is Record<s
 @Injectable({ providedIn: "root" })
 export class AgentApiService {
   #csrfToken: string | undefined;
+
+  /** The current session's CSRF token, if a session has been bootstrapped. */
+  getCsrfToken(): string | undefined {
+    return this.#csrfToken;
+  }
 
   async bootstrapSession(): Promise<void> {
     const response = await requireFetch(

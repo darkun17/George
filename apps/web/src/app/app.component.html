@@ -14,16 +14,19 @@
   <div class="workspace">
     <nav class="sidebar" aria-label="Navegación principal">
       <p class="nav-caption">ESPACIO PERSONAL</p>
-      @for (item of navigation; track item; let first = $first) {
+      @for (item of navigation; track item) {
         <button
           class="nav-item"
-          [class.active]="first"
-          [disabled]="item !== 'Inicio' && item !== 'Chat'"
+          [class.active]="isNavigationItemActive(item)"
+          [disabled]="!isNavigationItemActivatable(item)"
           type="button"
+          (click)="selectNavigationItem(item)"
         >
-          <span class="nav-icon" aria-hidden="true">{{ first ? "◈" : "·" }}</span>
+          <span class="nav-icon" aria-hidden="true">{{
+            isNavigationItemActivatable(item) ? "◈" : "·"
+          }}</span>
           {{ item }}
-          @if (!first) {
+          @if (!isNavigationItemActivatable(item)) {
             <span class="soon">PRONTO</span>
           }
         </button>
@@ -35,108 +38,113 @@
     </nav>
 
     <main class="main-panel">
-      <section class="welcome" aria-label="Estado de George">
-        <p class="eyebrow">TU ASISTENTE PERSONAL</p>
-        <div
-          class="orb-wrap"
-          [class.thinking]="facade.agentState() === 'THINKING'"
-          [class.executing]="facade.agentState() === 'EXECUTING'"
-          [class.waiting-approval]="facade.agentState() === 'WAITING_APPROVAL'"
-          [class.error]="facade.agentState() === 'ERROR'"
-        >
-          <div class="orb-halo"></div>
-          <div class="orb">
-            <div class="orb-core"></div>
-            <div class="orb-highlight"></div>
+      @if (activeView() === "settings") {
+        <george-settings />
+      }
+      @if (activeView() === "home") {
+        <section class="welcome" aria-label="Estado de George">
+          <p class="eyebrow">TU ASISTENTE PERSONAL</p>
+          <div
+            class="orb-wrap"
+            [class.thinking]="facade.agentState() === 'THINKING'"
+            [class.executing]="facade.agentState() === 'EXECUTING'"
+            [class.waiting-approval]="facade.agentState() === 'WAITING_APPROVAL'"
+            [class.error]="facade.agentState() === 'ERROR'"
+          >
+            <div class="orb-halo"></div>
+            <div class="orb">
+              <div class="orb-core"></div>
+              <div class="orb-highlight"></div>
+            </div>
           </div>
-        </div>
-        <h1>Buenas noches.</h1>
-        <p class="welcome-copy">Estoy aquí para ayudarte a pensar, crear y avanzar.</p>
-        <div class="agent-status" aria-live="polite">
-          <span class="agent-dot"></span>
-          GEORGE <span class="status-divider">/</span> {{ facade.agentState() }}
-        </div>
-        <div class="provider-status" aria-live="polite">
-          AI&nbsp; {{ facade.aiInfo()?.id?.toUpperCase() ?? "UNKNOWN" }}
-          <span class="status-divider">/</span> {{ facade.aiInfo()?.status ?? "UNKNOWN" }}
-          @if (facade.aiInfo()?.model) {
-            <span class="status-divider">·</span> MODEL&nbsp; {{ facade.aiInfo()?.model }}
-          }
-        </div>
-      </section>
-
-      <section class="conversation" #conversationEl aria-label="Conversación" aria-live="polite">
-        @for (message of facade.messages(); track message.id) {
-          <article class="message" [class.user-message]="message.role === 'user'">
-            <span class="message-author">{{ message.role === "user" ? "TÚ" : "GEORGE" }}</span>
-            <p>{{ message.content }}</p>
-          </article>
-        }
-      </section>
-
-      @for (approval of facade.approvals(); track approval.approvalId) {
-        <section class="approval-card" aria-label="Aprobación requerida">
-          <div>
-            <p class="eyebrow">GEORGE NECESITA AUTORIZACIÓN</p>
-            <h2>Permitir una acción</h2>
-            <p>
-              Herramienta: <strong>{{ approval.toolId }}</strong>
-            </p>
-            <p>
-              Riesgo: <strong>{{ approval.riskLevel }}</strong>
-            </p>
-            <small>Expira {{ approval.expiresAt | date: "HH:mm:ss" }}</small>
-            @if (approval.status === "EXPIRED") {
-              <p role="status">Esta autorización expiró.</p>
+          <h1>Buenas noches.</h1>
+          <p class="welcome-copy">Estoy aquí para ayudarte a pensar, crear y avanzar.</p>
+          <div class="agent-status" aria-live="polite">
+            <span class="agent-dot"></span>
+            GEORGE <span class="status-divider">/</span> {{ facade.agentState() }}
+          </div>
+          <div class="provider-status" aria-live="polite">
+            AI&nbsp; {{ facade.aiInfo()?.id?.toUpperCase() ?? "UNKNOWN" }}
+            <span class="status-divider">/</span> {{ facade.aiInfo()?.status ?? "UNKNOWN" }}
+            @if (facade.aiInfo()?.model) {
+              <span class="status-divider">·</span> MODEL&nbsp; {{ facade.aiInfo()?.model }}
             }
           </div>
-          <div class="approval-actions">
-            <button
-              type="button"
-              [disabled]="approvalActionDisabled(approval)"
-              (click)="resolveApproval(approval.approvalId, 'deny')"
-            >
-              Denegar
-            </button>
-            <button
-              type="button"
-              [disabled]="approvalActionDisabled(approval)"
-              (click)="resolveApproval(approval.approvalId, 'approve')"
-            >
-              {{
-                facade.resolvingApprovals().includes(approval.approvalId)
-                  ? "Procesando…"
-                  : "Permitir una vez"
-              }}
-            </button>
-          </div>
         </section>
-      }
 
-      <form class="composer" (submit)="$event.preventDefault(); submit()">
-        <label class="visually-hidden" for="prompt">Escribe un mensaje para George</label>
-        <span class="composer-symbol" aria-hidden="true">›</span>
-        <input
-          id="prompt"
-          [value]="input()"
-          (input)="onInput($event)"
-          [disabled]="facade.connection() !== 'ONLINE'"
-          placeholder="Pregúntame lo que quieras..."
-          autocomplete="off"
-        />
-        <span class="composer-hint">INTRO ↵</span>
-        <button
-          class="send-button"
-          type="submit"
-          [disabled]="!input().trim() || facade.connection() !== 'ONLINE' || facade.busy()"
-          aria-label="Enviar mensaje"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" /></svg>
-        </button>
-      </form>
-      <p class="privacy-note">
-        GEORGE PUEDE COMETER ERRORES · TUS DATOS PERMANECEN EN ESTE DISPOSITIVO
-      </p>
+        <section class="conversation" #conversationEl aria-label="Conversación" aria-live="polite">
+          @for (message of facade.messages(); track message.id) {
+            <article class="message" [class.user-message]="message.role === 'user'">
+              <span class="message-author">{{ message.role === "user" ? "TÚ" : "GEORGE" }}</span>
+              <p>{{ message.content }}</p>
+            </article>
+          }
+        </section>
+
+        @for (approval of facade.approvals(); track approval.approvalId) {
+          <section class="approval-card" aria-label="Aprobación requerida">
+            <div>
+              <p class="eyebrow">GEORGE NECESITA AUTORIZACIÓN</p>
+              <h2>Permitir una acción</h2>
+              <p>
+                Herramienta: <strong>{{ approval.toolId }}</strong>
+              </p>
+              <p>
+                Riesgo: <strong>{{ approval.riskLevel }}</strong>
+              </p>
+              <small>Expira {{ approval.expiresAt | date: "HH:mm:ss" }}</small>
+              @if (approval.status === "EXPIRED") {
+                <p role="status">Esta autorización expiró.</p>
+              }
+            </div>
+            <div class="approval-actions">
+              <button
+                type="button"
+                [disabled]="approvalActionDisabled(approval)"
+                (click)="resolveApproval(approval.approvalId, 'deny')"
+              >
+                Denegar
+              </button>
+              <button
+                type="button"
+                [disabled]="approvalActionDisabled(approval)"
+                (click)="resolveApproval(approval.approvalId, 'approve')"
+              >
+                {{
+                  facade.resolvingApprovals().includes(approval.approvalId)
+                    ? "Procesando…"
+                    : "Permitir una vez"
+                }}
+              </button>
+            </div>
+          </section>
+        }
+
+        <form class="composer" (submit)="$event.preventDefault(); submit()">
+          <label class="visually-hidden" for="prompt">Escribe un mensaje para George</label>
+          <span class="composer-symbol" aria-hidden="true">›</span>
+          <input
+            id="prompt"
+            [value]="input()"
+            (input)="onInput($event)"
+            [disabled]="facade.connection() !== 'ONLINE'"
+            placeholder="Pregúntame lo que quieras..."
+            autocomplete="off"
+          />
+          <span class="composer-hint">INTRO ↵</span>
+          <button
+            class="send-button"
+            type="submit"
+            [disabled]="!input().trim() || facade.connection() !== 'ONLINE' || facade.busy()"
+            aria-label="Enviar mensaje"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" /></svg>
+          </button>
+        </form>
+        <p class="privacy-note">
+          GEORGE PUEDE COMETER ERRORES · TUS DATOS PERMANECEN EN ESTE DISPOSITIVO
+        </p>
+      }
     </main>
 
     <aside class="activity-panel" aria-label="Actividad de George">

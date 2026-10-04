@@ -3,6 +3,10 @@
     "address": "127.0.0.1",
     "port": 43100
   },
+  "assistant": {
+    "name": "George",
+    "language": "es"
+  },
   "ai": {
     "provider": "mock",
     "ollama": {
@@ -12,6 +16,11 @@
   },
   "tools": {
     "grantedPermissions": [],
-    "developmentGrantedPermissions": ["system.info.read"]
+    "developmentGrantedPermissions": [
+      "system.info.read",
+      "apps.list.read",
+      "apps.open.execute",
+      "system.process.read"
+    ]
   }
 }

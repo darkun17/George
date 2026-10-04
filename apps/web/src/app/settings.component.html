@@ -1,0 +1,98 @@
+<div class="settings-panel" aria-label="Ajustes">
+  <header class="settings-header">
+    <p class="eyebrow">AJUSTES</p>
+    <h1>Configura a George</h1>
+  </header>
+
+  @if (statusMessage()) {
+    <p class="settings-status" role="status">{{ statusMessage() }}</p>
+  }
+
+  <section class="settings-section" aria-label="General">
+    <h2>General</h2>
+    <label class="settings-field">
+      <span>Nombre del asistente</span>
+      <input [value]="assistantName()" (input)="onAssistantNameInput($event)" />
+    </label>
+    <label class="settings-field">
+      <span>Idioma</span>
+      <input [value]="assistantLanguage()" (input)="onAssistantLanguageInput($event)" />
+    </label>
+    <label class="settings-field">
+      <span>Tu nombre (opcional)</span>
+      <input [value]="displayName()" (input)="onDisplayNameInput($event)" />
+    </label>
+    <p class="settings-hint">Local únicamente. Esta configuración no sale de tu equipo.</p>
+  </section>
+
+  <section class="settings-section" aria-label="Inteligencia artificial">
+    <h2>Inteligencia artificial</h2>
+    <label class="settings-field">
+      <span>Proveedor</span>
+      <select [value]="provider()" (change)="onProviderSelectChange($event)">
+        <option value="mock">Mock (sin IA real)</option>
+        <option value="ollama">Ollama (local)</option>
+      </select>
+    </label>
+    @if (provider() === "ollama") {
+      <label class="settings-field">
+        <span>Modelo</span>
+        <select [value]="ollamaModel()" (change)="onModelSelectChange($event)">
+          <option value="" disabled>Selecciona un modelo</option>
+          @for (model of ollamaModels(); track model) {
+            <option [value]="model">{{ model }}</option>
+          }
+        </select>
+      </label>
+      <button type="button" class="settings-secondary-button" (click)="discoverModels()">
+        Buscar modelos instalados
+      </button>
+      @if (!ollamaAvailable()) {
+        <p class="settings-hint">
+          No se pudo conectar con Ollama. Verifica que esté instalado y en ejecución.
+        </p>
+      }
+    }
+    <p class="settings-hint">
+      George no descarga modelos automáticamente. Cambiar de proveedor requiere reiniciar George
+      Host para activarlo.
+    </p>
+  </section>
+
+  <button type="button" class="settings-save-button" [disabled]="saving()" (click)="save()">
+    {{ saving() ? "Guardando…" : "Guardar cambios" }}
+  </button>
+
+  @if (doctor()) {
+    <section class="settings-section" aria-label="Diagnóstico de George">
+      <h2>George Doctor</h2>
+      @for (
+        group of [
+          { label: "Núcleo", checks: doctor()!.core },
+          { label: "Inteligencia artificial", checks: doctor()!.ai },
+          { label: "Seguridad", checks: doctor()!.security },
+          { label: "Sistema", checks: doctor()!.system },
+          { label: "Voz", checks: doctor()!.voice }
+        ];
+        track group.label
+      ) {
+        <div class="doctor-group">
+          <h3>{{ group.label }}</h3>
+          @for (check of group.checks; track check.id) {
+            <div class="doctor-row">
+              <span>{{ doctorCheckLabel(check.id) }}</span>
+              <span
+                class="doctor-state"
+                [class.doctor-state-ok]="check.state === 'AVAILABLE'"
+                [class.doctor-state-warn]="
+                  check.state === 'MISCONFIGURED' || check.state === 'UNAVAILABLE'
+                "
+                >{{ doctorStateLabel(check.state) }}</span
+              >
+            </div>
+          }
+        </div>
+      }
+    </section>
+  }
+</div>

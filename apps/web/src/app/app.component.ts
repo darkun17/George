@@ -2,7 +2,15 @@ import { Component, ViewChild, effect, inject, signal } from "@angular/core";
 import type { ElementRef, OnDestroy, OnInit } from "@angular/core";
 import { DatePipe } from "@angular/common";
 import { AgentFacade, isApprovalActionDisabled } from "./agent-facade.service.js";
+import { SettingsComponent } from "./settings.component.js";
 import type { ApprovalRequest } from "@george/protocol";
+
+export type AppView = "home" | "settings";
+const ACTIVATABLE_NAVIGATION_ITEMS: ReadonlySet<string> = new Set(["Inicio", "Chat", "Ajustes"]);
+
+export function isNavigationItemActivatable(item: string): boolean {
+  return ACTIVATABLE_NAVIGATION_ITEMS.has(item);
+}
 
 /** Pixels of slack from the bottom of the chat history still counted as "at the bottom". */
 export const AUTO_SCROLL_NEAR_BOTTOM_PX = 120;
@@ -23,13 +31,15 @@ export function shouldAutoScroll(
 @Component({
   selector: "george-root",
   standalone: true,
-  imports: [DatePipe],
+  imports: [DatePipe, SettingsComponent],
   templateUrl: "./app.component.html"
 })
 export class AppComponent implements OnInit, OnDestroy {
   readonly facade = inject(AgentFacade);
   readonly input = signal("");
   readonly navigation = ["Inicio", "Chat", "Proyectos", "Memoria", "Actividad", "Ajustes"];
+  readonly activeView = signal<AppView>("home");
+  readonly isNavigationItemActivatable = isNavigationItemActivatable;
 
   @ViewChild("conversationEl") private conversationRef?: ElementRef<HTMLElement>;
   #lastMessageCount = 0;
@@ -48,6 +58,17 @@ export class AppComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     void this.facade.connect();
+  }
+
+  selectNavigationItem(item: string): void {
+    if (!isNavigationItemActivatable(item)) return;
+    this.activeView.set(item === "Ajustes" ? "settings" : "home");
+  }
+
+  isNavigationItemActive(item: string): boolean {
+    if (item === "Ajustes") return this.activeView() === "settings";
+    if (item === "Inicio" || item === "Chat") return this.activeView() === "home";
+    return false;
   }
 
   ngOnDestroy(): void {
