@@ -63,6 +63,123 @@
     {{ saving() ? "Guardando…" : "Guardar cambios" }}
   </button>
 
+  <section class="settings-section" aria-label="Proyectos">
+    <h2>Proyectos</h2>
+    <p class="settings-hint">
+      Los proyectos que agregues aquí son solo referencias de configuración. George no copia, mueve
+      ni modifica tus archivos.
+    </p>
+
+    @if (projectStatusMessage()) {
+      <p class="settings-status" role="status">{{ projectStatusMessage() }}</p>
+    }
+
+    @for (project of projects(); track project.projectId) {
+      <div class="project-row">
+        <div>
+          <strong>{{ project.displayName }}</strong>
+          <small>{{ project.projectId }}</small>
+          @if (!project.rootAvailable) {
+            <p role="status">La carpeta del proyecto no está disponible.</p>
+          }
+        </div>
+        <div class="project-row-actions">
+          <button
+            type="button"
+            class="settings-secondary-button"
+            (click)="startEditProject(project)"
+          >
+            Editar
+          </button>
+          @if (confirmingRemoveProjectId() === project.projectId) {
+            <span class="project-remove-confirm">
+              <p>Esto elimina el proyecto de George. Los archivos del equipo no se modificarán.</p>
+              <button type="button" (click)="cancelRemoveProject()">Cancelar</button>
+              <button type="button" (click)="confirmRemoveProject(project.projectId)">
+                Quitar proyecto
+              </button>
+            </span>
+          } @else {
+            <button
+              type="button"
+              class="settings-secondary-button"
+              (click)="askRemoveProject(project.projectId)"
+            >
+              Quitar
+            </button>
+          }
+        </div>
+      </div>
+    }
+
+    @if (!projectFormOpen()) {
+      <button type="button" class="settings-secondary-button" (click)="startAddProject()">
+        Agregar proyecto
+      </button>
+    } @else {
+      <div class="settings-field-group">
+        @if (!editingProjectId()) {
+          <label class="settings-field">
+            <span>Identificador</span>
+            <input
+              [value]="projectFormId()"
+              (input)="onProjectFormIdInput($event)"
+              placeholder="george"
+            />
+          </label>
+        }
+        <label class="settings-field">
+          <span>Nombre</span>
+          <input
+            [value]="projectFormDisplayName()"
+            (input)="onProjectFormDisplayNameInput($event)"
+          />
+        </label>
+        <label class="settings-field">
+          <span>Descripción (opcional)</span>
+          <input
+            [value]="projectFormDescription()"
+            (input)="onProjectFormDescriptionInput($event)"
+          />
+        </label>
+        <label class="settings-field">
+          <span>Ruta de la carpeta</span>
+          <input
+            [value]="projectFormRootPath()"
+            (input)="onProjectFormRootPathInput($event)"
+            placeholder="C:\Proyectos\mi-proyecto"
+          />
+        </label>
+        <label class="settings-field">
+          <span>Aplicación por defecto (opcional)</span>
+          <select
+            [value]="projectFormDefaultApplicationId()"
+            (change)="onProjectFormDefaultApplicationChange($event)"
+          >
+            <option value="">Ninguna</option>
+            @for (app of applications(); track app.id) {
+              <option [value]="app.id">{{ app.displayName }}</option>
+            }
+          </select>
+        </label>
+        @if (projectFormError()) {
+          <p class="settings-status" role="status">{{ projectFormError() }}</p>
+        }
+        <div class="project-row-actions">
+          <button type="button" (click)="cancelProjectForm()">Cancelar</button>
+          <button
+            type="button"
+            class="settings-save-button"
+            [disabled]="savingProject()"
+            (click)="saveProject()"
+          >
+            {{ savingProject() ? "Guardando…" : "Guardar proyecto" }}
+          </button>
+        </div>
+      </div>
+    }
+  </section>
+
   @if (doctor()) {
     <section class="settings-section" aria-label="Diagnóstico de George">
       <h2>George Doctor</h2>
@@ -72,7 +189,9 @@
           { label: "Inteligencia artificial", checks: doctor()!.ai },
           { label: "Seguridad", checks: doctor()!.security },
           { label: "Sistema", checks: doctor()!.system },
-          { label: "Voz", checks: doctor()!.voice }
+          { label: "Voz", checks: doctor()!.voice },
+          { label: "Git", checks: doctor()!.git },
+          { label: "Proyectos", checks: doctor()!.projects }
         ];
         track group.label
       ) {

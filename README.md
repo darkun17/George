@@ -1,8 +1,11 @@
 # George
 
 George is a local-first Personal AI Operating System for Windows, designed to grow into a portable,
-configurable assistant. The repository is in **pre-alpha**. M4.1 provides a local Angular Command Center,
-George Host, provider-independent Agent Core, optional Ollama provider, and a policy-gated Tool Runtime.
+configurable assistant. The repository is in **pre-alpha**. Through M5.2, George provides a local
+Angular Command Center, George Host, provider-independent Agent Core, optional Ollama provider, a
+policy-gated Tool Runtime with approvals and durable audit, a Settings UI/George Doctor, one
+approval-gated desktop launcher (`apps.open`), and a configuration-only Projects surface with
+read-only Git and scoped filesystem tools.
 
 The application is generic; each installation supplies its own profile, data, credentials,
 projects, tools, and policies. User data and secrets do not belong in this repository.
@@ -17,9 +20,11 @@ projects, tools, and policies. User data and secrets do not belong in this repos
 ## Architecture
 
 The pnpm TypeScript monorepo contains `protocol` (shared contracts), `tools-sdk` (Zod tool
-definitions), `tools-core` (registry, policy gate, runtime, and `system.info`), `policy` (default
-allow/ask/deny decisions), `config`, `ai` (mock and Ollama adapters), `core` (Agent Runtime),
-`apps/host` (loopback HTTP and SSE), and `apps/web` (Angular Command Center). See
+definitions), `tools-core` (registry, policy gate, runtime, `system.info`,
+`apps.list`/`apps.open`, `ProjectRegistry`, read-only Git tools, and scoped filesystem tools),
+`policy` (default allow/ask/deny decisions), `config` (profile and project schema), `ai` (mock and
+Ollama adapters), `core` (Agent Runtime), `apps/host` (loopback HTTP, SSE, Settings, Doctor, and
+Projects routes), and `apps/web` (Angular Command Center, Settings, and Projects UI). See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Requirements
@@ -62,13 +67,17 @@ without cloud accounts or API keys.
 
 ## Security
 
-Do not add secrets, personal profiles, local databases, or runtime data to Git. The only built-in
-tool is read-only `system.info`; every tool handler is gated by PolicyEngine. High-risk `ASK` never
-executes and returns `APPROVAL_REQUIRED`; there is no approval flow yet. Ollama can return
-structured tool requests, but George alone authorizes them through PolicyEngine and executes them
-through ToolRuntime. There is no shell, filesystem, process-list, or application-control tool.
-The local Host uses an ephemeral session cookie and CSRF token; plain HTTP is not encrypted against
-other processes on the device. Read [docs/SECURITY.md](docs/SECURITY.md) before adding capabilities.
+Do not add secrets, personal profiles, local databases, or runtime data to Git. George has no shell
+and no tool that accepts a model-supplied path, command, or raw Git argument. Every tool handler is
+gated by PolicyEngine; high-risk `ASK` requires one-time human approval through the persistent
+approval pipeline before it executes. `apps.open` and `project.open` are the only two capabilities
+with a system-level effect (launching a trusted, registry-resolved application), both approval-gated.
+Git tools (`git.status`, `git.branch.current`, `git.log`, `git.diff`) are strictly read-only.
+Filesystem tools (`filesystem.list`, `filesystem.read`, `filesystem.search`) are scoped to a
+configured project root, deny sensitive files (`.env`, keys, credentials) by default, and never
+accept an absolute path. The local Host uses an ephemeral session cookie and CSRF token; plain HTTP
+is not encrypted against other processes on the device. Read
+[docs/SECURITY.md](docs/SECURITY.md) before adding capabilities.
 
 ## Tool Runtime (M4)
 
@@ -87,6 +96,17 @@ ToolRuntime with policy checks, up to four tool-call rounds and eight calls per 
 are request-local data, limited to 16 KiB, and discarded after the request. Provider and model
 support can vary; Ollama checks the selected model's advertised `tools` capability via `/api/show`.
 Unsupported models are never simulated by parsing free-form text. See [docs/SECURITY.md](docs/SECURITY.md).
+
+## Projects, read-only Git, and scoped files (M5.2)
+
+Settings → Proyectos lets you add a project as a configuration-only reference to an existing folder
+(an id, display name, root path, and an optional default application) -- George never creates, moves,
+or deletes that folder, and removing a project from George only edits George's own configuration.
+The Proyectos view shows the project's root/Git/branch status and an "Abrir proyecto" action that goes
+through the same approval pipeline as every other high-risk tool. The AI can only ever reference a
+project by its configured `projectId`; it can never supply a raw path, `cwd`, or Git argument. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/SECURITY.md](docs/SECURITY.md) for the full
+design and threat review.
 
 ## Roadmap
 

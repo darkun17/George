@@ -2,6 +2,20 @@ import { z } from "zod";
 import type { Channel } from "@george/protocol";
 import defaults from "../../../george.defaults.json" with { type: "json" };
 
+export const projectDefinitionSchema = z.object({
+  id: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .regex(/^[a-z0-9][a-z0-9._-]*$/, "Project id must be a lowercase machine-readable identifier."),
+  displayName: z.string().trim().min(1).max(200),
+  description: z.string().trim().max(2000).optional(),
+  rootPath: z.string().trim().min(1),
+  defaultApplicationId: z.string().trim().min(1).optional()
+});
+export type ProjectDefinition = z.output<typeof projectDefinitionSchema>;
+
 export const assistantProfileSchema = z.object({
   assistant: z.object({
     name: z.string().trim().min(1),
@@ -12,7 +26,15 @@ export const assistantProfileSchema = z.object({
     provider: z.enum(["mock", "ollama"]),
     credentialRef: z.string().trim().min(1).optional(),
     ollama: z.object({ model: z.string().trim().min(1) }).optional()
-  })
+  }),
+  projects: z
+    .array(projectDefinitionSchema)
+    .max(64)
+    .refine(
+      (projects) => new Set(projects.map((project) => project.id)).size === projects.length,
+      "Project ids must be unique."
+    )
+    .default([])
 });
 
 export type AssistantProfileInput = z.input<typeof assistantProfileSchema>;

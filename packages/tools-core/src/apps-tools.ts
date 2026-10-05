@@ -4,6 +4,28 @@ import type { ToolDefinition } from "@george/tools-sdk";
 import { z } from "zod";
 import type { ApplicationRegistry } from "./application-registry.js";
 
+/**
+ * Spawns a resolved, trusted executable with a structured, internally-constructed argument
+ * list. Shared by apps.open and project.open so there is exactly one place that ever calls
+ * `spawn` for a desktop action -- never shell:true, never a caller-supplied path or argv.
+ */
+export function launchExecutable(
+  resolvedPath: string,
+  args: readonly string[] = []
+): { readonly ok: true } | { readonly ok: false } {
+  try {
+    const child = spawn(resolvedPath, [...args], { shell: false, detached: true, stdio: "ignore" });
+    child.on("error", () => {
+      // Surfaces asynchronously after this function has already returned; detached + ignored
+      // stdio means a launch failure here cannot affect the Agent response.
+    });
+    child.unref();
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
 const appsListInputSchema = z.object({}).strict();
 interface AppsListOutput {
   readonly applications: readonly {
@@ -58,15 +80,7 @@ export function createAppsOpenTool(
           }
         };
       }
-      try {
-        const child = spawn(resolvedPath, [], { shell: false, detached: true, stdio: "ignore" });
-        child.on("error", () => {
-          // The spawn error surfaces asynchronously after this handler has already
-          // returned; there is no pending promise left to reject. Detached + ignored
-          // stdio means a launch failure here cannot affect the Agent response.
-        });
-        child.unref();
-      } catch {
+      if (!launchExecutable(resolvedPath).ok) {
         return {
           status: "failed",
           error: {

@@ -540,3 +540,27 @@ export type { TrustedApplication } from "./application-registry.js";
 export { createAppsListTool, createAppsOpenTool } from "./apps-tools.js";
 export { systemProcessListTool, parseTasklistCsv } from "./process-list-tool.js";
 export type { ProcessInfo } from "./process-list-tool.js";
+export { ProjectRegistry } from "./project-registry.js";
+export type { ProjectDefinition, ProjectRootStatus } from "./project-registry.js";
+export { resolveProjectPath, assertRealPathContained, canonicalizeRoot } from "./project-path.js";
+export type { PathResolution, PathRejectionReason } from "./project-path.js";
+export { isSensitivePath } from "./sensitive-files.js";
+export { GitAdapter, GitUnavailableError, GitOperationError } from "./git-adapter.js";
+export type { GitStatusResult, GitStatusEntry, GitLogEntry, GitDiffResult } from "./git-adapter.js";
+export {
+  createProjectListTool,
+  createProjectInfoTool,
+  createProjectOpenTool
+} from "./project-tools.js";
+export {
+  createGitStatusTool,
+  createGitBranchCurrentTool,
+  createGitLogTool,
+  createGitDiffTool
+} from "./git-tools.js";
+export {
+  createFilesystemListTool,
+  createFilesystemReadTool,
+  createFilesystemSearchTool
+} from "./filesystem-tools.js";
+export * from "./output-limits.js";

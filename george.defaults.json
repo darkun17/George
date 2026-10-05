@@ -20,7 +20,14 @@
       "system.info.read",
       "apps.list.read",
       "apps.open.execute",
-      "system.process.read"
+      "system.process.read",
+      "projects.list.read",
+      "projects.read",
+      "projects.open.execute",
+      "git.read",
+      "filesystem.list.read",
+      "filesystem.read",
+      "filesystem.search.read"
     ]
   }
 }

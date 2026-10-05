@@ -6,7 +6,9 @@ import {
   loadAIConfiguration,
   loadHostConfiguration,
   PermissionResolver,
-  parseAssistantProfile
+  parseAssistantProfile,
+  projectDefinitionSchema,
+  assistantProfileSchema
 } from "./index.js";
 
 describe("parseAssistantProfile", () => {
@@ -58,17 +60,26 @@ describe("AI provider configuration", () => {
   });
 });
 
+const EXPECTED_DEVELOPMENT_GRANTED_PERMISSIONS = [
+  "system.info.read",
+  "apps.list.read",
+  "apps.open.execute",
+  "system.process.read",
+  "projects.list.read",
+  "projects.read",
+  "projects.open.execute",
+  "git.read",
+  "filesystem.list.read",
+  "filesystem.read",
+  "filesystem.search.read"
+];
+
 describe("loadHostConfiguration", () => {
   it("defaults to loopback and the configured local port", () => {
     expect(loadHostConfiguration({})).toEqual({
       host: { address: "127.0.0.1", port: 43100 },
       tools: {
-        grantedPermissions: [
-          "system.info.read",
-          "apps.list.read",
-          "apps.open.execute",
-          "system.process.read"
-        ],
+        grantedPermissions: EXPECTED_DEVELOPMENT_GRANTED_PERMISSIONS,
         deniedPermissions: []
       }
     });
@@ -105,12 +116,9 @@ describe("loadHostConfiguration", () => {
   });
 
   it("grants the development diagnostic permissions explicitly and defaults production to none", () => {
-    expect(loadHostConfiguration({ NODE_ENV: "test" }).tools.grantedPermissions).toEqual([
-      "system.info.read",
-      "apps.list.read",
-      "apps.open.execute",
-      "system.process.read"
-    ]);
+    expect(loadHostConfiguration({ NODE_ENV: "test" }).tools.grantedPermissions).toEqual(
+      EXPECTED_DEVELOPMENT_GRANTED_PERMISSIONS
+    );
     expect(loadHostConfiguration({ NODE_ENV: "production" }).tools.grantedPermissions).toEqual([]);
   });
 
@@ -123,5 +131,50 @@ describe("loadHostConfiguration", () => {
     expect(() => loadHostConfiguration({ GEORGE_TOOL_PERMISSIONS: "*" })).toThrow(
       InvalidConfigurationError
     );
+  });
+});
+
+describe("projectDefinitionSchema", () => {
+  const valid = { id: "george", displayName: "George", rootPath: "C:\\Projects\\George" };
+
+  it("accepts a valid machine-readable id", () => {
+    expect(projectDefinitionSchema.safeParse(valid).success).toBe(true);
+    expect(projectDefinitionSchema.safeParse({ ...valid, id: "my-project.2" }).success).toBe(true);
+  });
+
+  it("rejects an id that is not a safe machine-readable identifier", () => {
+    expect(projectDefinitionSchema.safeParse({ ...valid, id: "My Project" }).success).toBe(false);
+    expect(
+      projectDefinitionSchema.safeParse({ ...valid, id: "C:\\Projects\\George" }).success
+    ).toBe(false);
+    expect(projectDefinitionSchema.safeParse({ ...valid, id: "" }).success).toBe(false);
+  });
+
+  it("rejects a missing rootPath or displayName", () => {
+    expect(projectDefinitionSchema.safeParse({ id: "george" }).success).toBe(false);
+  });
+});
+
+describe("assistantProfileSchema projects", () => {
+  it("defaults to an empty project list when absent", () => {
+    const parsed = assistantProfileSchema.parse({
+      assistant: { name: "George", language: "es" },
+      user: {},
+      ai: { provider: "mock" }
+    });
+    expect(parsed.projects).toEqual([]);
+  });
+
+  it("rejects duplicate project ids", () => {
+    const result = assistantProfileSchema.safeParse({
+      assistant: { name: "George", language: "es" },
+      user: {},
+      ai: { provider: "mock" },
+      projects: [
+        { id: "george", displayName: "George", rootPath: "C:\\a" },
+        { id: "george", displayName: "George Again", rootPath: "C:\\b" }
+      ]
+    });
+    expect(result.success).toBe(false);
   });
 });

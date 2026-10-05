@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -137,7 +138,17 @@ describe("George Host HTTP boundary", () => {
       "system.info",
       "apps.list",
       "apps.open",
-      "system.process.list"
+      "system.process.list",
+      "project.list",
+      "project.info",
+      "project.open",
+      "git.status",
+      "git.branch.current",
+      "git.log",
+      "git.diff",
+      "filesystem.list",
+      "filesystem.read",
+      "filesystem.search"
     ]);
     expect(response.json().tools[0]).toEqual({
       id: "system.info",
@@ -1081,5 +1092,269 @@ describe("M5.1 desktop action tools (apps.list, apps.open, system.process.list)"
     expect(Array.isArray(result.output.processes)).toBe(true);
     expect(result.output.processes.length).toBeGreaterThan(0);
     expect(response.body).not.toMatch(/--|cmdline/i);
+  });
+});
+
+describe("M5.2 projects, Git, and safe filesystem tools", () => {
+  function gitRepo(): string {
+    const root = mkdtempSync(join(tmpdir(), "george-server-project-"));
+    temporaryDirectories.push(root);
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], {
+      cwd: root,
+      stdio: "ignore"
+    });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "README.md"), "# Test project\nThis is a test.");
+    execFileSync("git", ["add", "-A"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "initial"], { cwd: root, stdio: "ignore" });
+    return root;
+  }
+
+  it("requires a local session to list projects and never exposes root paths", async () => {
+    const app = await createServer();
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/projects" });
+    expect(anonymous.statusCode).toBe(401);
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/projects",
+      headers: { cookie: session.cookie }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ projects: [], truncated: false });
+  });
+
+  it("requires Origin, session, and CSRF to add a project, validates the root, and persists it", async () => {
+    const root = gitRepo();
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const noCsrf = await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers: { origin: ORIGIN, cookie: session.cookie },
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    expect(noCsrf.statusCode).toBe(403);
+
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const added = await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    expect(added.statusCode).toBe(200);
+    expect(added.json()).toMatchObject({ id: "george", displayName: "George" });
+
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/v1/projects",
+      headers: { cookie: session.cookie }
+    });
+    expect(listed.json().projects).toEqual([
+      { projectId: "george", displayName: "George", rootAvailable: true, gitRepository: true }
+    ]);
+  });
+
+  it("rejects adding a project with a root that does not exist", async () => {
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "ghost", displayName: "Ghost", rootPath: "Z:\\george-test-does-not-exist" }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: { code: "PROJECT_ROOT_UNAVAILABLE" } });
+  });
+
+  it("rejects a duplicate project id with 409", async () => {
+    const root = gitRepo();
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George Again", rootPath: root }
+    });
+    expect(duplicate.statusCode).toBe(409);
+  });
+
+  it("removes only George's configuration for a project -- the real directory is untouched", async () => {
+    const root = gitRepo();
+    const app = await createServer();
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    const removed = await app.inject({
+      method: "DELETE",
+      url: "/api/v1/settings/projects/george",
+      headers
+    });
+    expect(removed.statusCode).toBe(200);
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/v1/projects",
+      headers: { cookie: session.cookie }
+    });
+    expect(listed.json().projects).toEqual([]);
+    expect(existsSync(root)).toBe(true);
+  });
+
+  it("George, revisa el estado del proyecto George: a full Agent flow combining project.info and git.status", async () => {
+    const root = gitRepo();
+    writeFileSync(join(root, "README.md"), "# Test project\nchanged");
+    let turn = 0;
+    const provider: ManagedAIProvider = {
+      id: "scripted",
+      capabilities: { streaming: false, tools: true },
+      management: {
+        getInfo: async () => ({
+          id: "scripted",
+          status: "AVAILABLE",
+          model: "fake",
+          models: ["fake"]
+        }),
+        listModels: async () => ["fake"]
+      },
+      async chat() {
+        turn++;
+        if (turn === 1) {
+          return {
+            kind: "tool_calls",
+            calls: [{ id: "info-1", toolId: "project.info", input: { projectId: "george" } }]
+          };
+        }
+        if (turn === 2) {
+          return {
+            kind: "tool_calls",
+            calls: [{ id: "status-1", toolId: "git.status", input: { projectId: "george" } }]
+          };
+        }
+        return {
+          kind: "message",
+          text: "El proyecto George tiene cambios sin confirmar en la rama main."
+        };
+      }
+    };
+    const app = await createServer(provider);
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers,
+      payload: { conversationId: "c", input: "George, revisa el estado del proyecto George." }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "completed",
+      content: "El proyecto George tiene cambios sin confirmar en la rama main."
+    });
+  });
+
+  it("SECURITY: a path-traversal attempt through the full Agent pipeline is rejected, not silently sandboxed", async () => {
+    const root = gitRepo();
+    const provider: ManagedAIProvider = {
+      id: "scripted",
+      capabilities: { streaming: false, tools: true },
+      management: {
+        getInfo: async () => ({
+          id: "scripted",
+          status: "AVAILABLE",
+          model: "fake",
+          models: ["fake"]
+        }),
+        listModels: async () => ["fake"]
+      },
+      async chat() {
+        return {
+          kind: "tool_calls",
+          calls: [
+            {
+              id: "read-1",
+              toolId: "filesystem.read",
+              input: {
+                projectId: "george",
+                relativePath: "../../../Windows/System32/drivers/etc/hosts"
+              }
+            }
+          ]
+        };
+      }
+    };
+    const app = await createServer(provider);
+    const session = await bootstrap(app);
+    const headers = { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken };
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/settings/projects",
+      headers,
+      payload: { id: "george", displayName: "George", rootPath: root }
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers,
+      payload: { conversationId: "c", input: "lee un archivo fuera del proyecto" }
+    });
+    // TOOL_EXECUTION_FAILED is the generic mapping ToolRuntime always uses for a handler's own
+    // "failed" result (see #mapHandlerResult) -- the important assertion is that the request
+    // never completes successfully with file content, and the tool is never granted a retry.
+    expect(response.statusCode).not.toBe(200);
+    expect(JSON.stringify(response.json())).not.toMatch(/root:|localhost/);
+  });
+
+  it("SECURITY: an unknown projectId is rejected rather than silently resolved to some default", async () => {
+    const provider: ManagedAIProvider = {
+      id: "scripted",
+      capabilities: { streaming: false, tools: true },
+      management: {
+        getInfo: async () => ({
+          id: "scripted",
+          status: "AVAILABLE",
+          model: "fake",
+          models: ["fake"]
+        }),
+        listModels: async () => ["fake"]
+      },
+      async chat() {
+        return {
+          kind: "tool_calls",
+          calls: [{ id: "list-1", toolId: "project.info", input: { projectId: "unknown-project" } }]
+        };
+      }
+    };
+    const app = await createServer(provider);
+    const session = await bootstrap(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/requests",
+      headers: { origin: ORIGIN, cookie: session.cookie, "x-george-csrf": session.csrfToken },
+      payload: { conversationId: "c", input: "revisa un proyecto que no existe" }
+    });
+    expect(response.statusCode).not.toBe(200);
   });
 });

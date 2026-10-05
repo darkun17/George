@@ -26,11 +26,11 @@ describe("isNavigationItemActivatable", () => {
   it("only activates navigation items that have real functionality", () => {
     expect(isNavigationItemActivatable("Inicio")).toBe(true);
     expect(isNavigationItemActivatable("Chat")).toBe(true);
+    expect(isNavigationItemActivatable("Proyectos")).toBe(true);
     expect(isNavigationItemActivatable("Ajustes")).toBe(true);
   });
 
   it("keeps not-yet-built sections disabled", () => {
-    expect(isNavigationItemActivatable("Proyectos")).toBe(false);
     expect(isNavigationItemActivatable("Memoria")).toBe(false);
     expect(isNavigationItemActivatable("Actividad")).toBe(false);
   });

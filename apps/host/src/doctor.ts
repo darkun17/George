@@ -22,6 +22,16 @@ export interface DoctorReport {
   readonly security: readonly DoctorCheck[];
   readonly system: readonly DoctorCheck[];
   readonly voice: readonly DoctorCheck[];
+  readonly git: readonly DoctorCheck[];
+  readonly projects: readonly DoctorCheck[];
+}
+
+export interface ProjectDoctorStatus {
+  readonly id: string;
+  readonly displayName: string;
+  readonly rootAvailable: boolean;
+  readonly gitRepository: boolean;
+  readonly defaultApplicationAvailable?: boolean;
 }
 
 export interface DoctorDependencies {
@@ -33,12 +43,19 @@ export interface DoctorDependencies {
   readonly trustedOriginCount: () => number;
   readonly appVersion: string;
   readonly dataDirectory: string;
+  /** Bounded, timed-out probe -- never shells out without a timeout. */
+  readonly gitAvailable: () => Promise<{ readonly available: boolean; readonly version?: string }>;
+  /** Per-project status without any recursive filesystem scan. */
+  readonly projectStatuses: () => Promise<readonly ProjectDoctorStatus[]>;
   readonly clock?: () => Date;
 }
 
 export async function buildDoctorReport(deps: DoctorDependencies): Promise<DoctorReport> {
   const now = (deps.clock ?? (() => new Date()))();
   const aiInfo = await deps.aiProvider.management.getInfo().catch(() => undefined);
+  const git = await deps.gitAvailable().catch(() => ({ available: false }));
+  const projects = await deps.projectStatuses().catch(() => []);
+  const invalidProjectCount = projects.filter((project) => !project.rootAvailable).length;
 
   return {
     generatedAt: now.toISOString(),
@@ -90,6 +107,25 @@ export async function buildDoctorReport(deps: DoctorDependencies): Promise<Docto
       { id: "microphone", state: "NOT_INSTALLED" },
       { id: "speechToText", state: "NOT_INSTALLED" },
       { id: "textToSpeech", state: "NOT_INSTALLED" }
+    ],
+    git: [
+      {
+        id: "executable",
+        state: git.available ? "AVAILABLE" : "UNAVAILABLE",
+        ...("version" in git && git.version ? { detail: git.version } : {})
+      }
+    ],
+    projects: [
+      {
+        id: "registry",
+        state: "AVAILABLE",
+        detail: `${projects.length} configured, ${invalidProjectCount} with an unavailable root`
+      },
+      ...projects.map((project) => ({
+        id: `project:${project.id}`,
+        state: (project.rootAvailable ? "AVAILABLE" : "UNAVAILABLE") as DoctorState,
+        detail: project.displayName
+      }))
     ]
   };
 }

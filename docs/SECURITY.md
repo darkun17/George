@@ -2,14 +2,24 @@
 
 ## Current posture
 
-M4.1 runs a local Host and Angular Command Center. Its only built-in tool is read-only `system.info`;
-it does not execute arbitrary commands or access personal files,
-persist conversations, or store secrets. Ollama is optional, local-only, and receives prompts only
+George runs a local Host and Angular Command Center. It does not execute arbitrary commands, a
+shell, or model-supplied paths/arguments of any kind. Through M5.2 it has: a read-only
+`system.info`/`system.process.list`; one approval-gated desktop launcher, `apps.open`, resolving only
+a trusted `applicationId` through `ApplicationRegistry`; a configuration-only `ProjectRegistry`
+mapping a trusted `projectId` to a validated, continuously re-checked filesystem root;
+strictly read-only Git tools (`git.status`, `git.branch.current`, `git.log`, `git.diff`) spawned with
+a fixed executable and structured argv, never a shell; and project-scoped filesystem tools
+(`filesystem.list`, `filesystem.read`, `filesystem.search`) that deny sensitive files by default and
+never accept an absolute path. `project.open` is the only other approval-gated desktop action, reusing
+`ApplicationRegistry` the same way `apps.open` does. George does not persist conversations, store
+secrets, or write/modify/delete any file. Ollama is optional, local-only, and receives prompts only
 when selected by configuration. Structured model tool calls are untrusted requests and run only
 through ToolRuntime and PolicyEngine. The Host binds to `127.0.0.1`, uses
 an ephemeral session and CSRF token, validates exact Origins, and exposes only the small versioned
-API. Its audit sink is in-memory and not durable. Policy remains a starting point, not an
-authorization system until connected to trusted identity, permissions, approval, and audit storage.
+API. Its audit sink is durable (SQLite, outside the repository) and never stores prompts, tool
+input/output, file contents, or secrets. Policy, permissions, approval, and audit are connected and
+enforced; this remains a snapshot of current scope, not a claim that every future capability is safe
+by default.
 
 ## Initial threat register
 
@@ -19,7 +29,7 @@ authorization system until connected to trusted identity, permissions, approval,
 | Prompt injection            | Unauthorized tool requests or disclosure                                             | Treat all external content as untrusted data; it cannot grant permissions, alter policy/configuration, approve actions, bypass confirmation, or elevate privileges; independent PolicyEngine and trusted approval checks | Design requirement; enforcement future             |
 | Malicious localhost webpage | A hostile website invokes the local Host API to operate tools or disclose local data | Loopback-only bind; exact Origin validation; no CORS; HttpOnly SameSite session cookie; CSRF token for POST; authenticated SSE; CSP, safe headers, bounded requests, timeouts                                            | Implemented for M4 endpoints                       |
 | Malicious plugins           | Code execution or data exfiltration                                                  | No plugin loader in M4; later require explicit trust, capability limits, and isolation review                                                                                                                            | Out of scope                                       |
-| Path traversal              | Access beyond approved roots                                                         | Validate canonical paths and scope filesystem tools; no filesystem tools in M4                                                                                                                                           | Future design                                      |
+| Path traversal              | Access beyond approved roots                                                         | M5.2: canonicalize and re-resolve every path against a trusted `ProjectRegistry` root (never a bare `startsWith` prefix check), re-check real paths immediately before a sensitive read                                  | Implemented in M5.2                                |
 | Secret leakage              | Account compromise                                                                   | No secrets in repo or plaintext database; future OS-backed SecretStore and redacted logs                                                                                                                                 | Policy documented                                  |
 | Unauthorized file access    | Private data disclosure or modification                                              | Least privilege and explicit user-approved roots; no filesystem adapter in M2                                                                                                                                            | Future design                                      |
 | Excessive permissions       | Broad, persistent access                                                             | Per-tool declared permissions, policy checks, narrow grants and revocation                                                                                                                                               | Contracts started; enforcement future              |
@@ -172,3 +182,24 @@ No tool in this milestone can write to the filesystem, execute a shell, or accep
 arguments of any kind; `apps.open` and `system.process.list` are the only two capabilities with any
 system-level effect, and both pass through the same ToolRuntime → PolicyEngine → Approval → Audit
 pipeline as every other tool. Production has no implicit grant for either.
+
+## M5.2 Projects, read-only Git, and scoped filesystem threat review
+
+| Threat                                                                   | Impact                                                       | Mitigation                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Model-supplied arbitrary filesystem root, `cwd`, or path                 | Arbitrary filesystem read/execution outside intent           | Every tool input schema is Zod `.strict()` and accepts only a trusted `projectId` and, for filesystem tools, a relative `relativePath`; there is no `path`, `cwd`, `root`, or `gitArgs` field anywhere in the input surface. A path only ever resolves through `ProjectRegistry`.                                                                                          |
+| Prefix-collision path escape (`C:\Projects\foo` vs `C:\Projects\foobar`) | Read access to an unrelated sibling directory                | Containment is `resolved === root \|\| resolved.startsWith(root + sep)`, never a bare `startsWith(root)`; covered by a dedicated test using the exact example above.                                                                                                                                                                                                       |
+| Symlink/junction created after the project root was validated            | TOCTOU escape outside the approved root                      | `assertRealPathContained` re-resolves both the root and the candidate path with `realpathSync.native` immediately before every sensitive read, independent of the earlier lexical check; `ProjectRegistry.resolveRoot` itself re-canonicalizes and re-`stat`s on every call, never caching a result from registration time.                                                |
+| Reading `.env`, private keys, or other credential material               | Credential/secret disclosure                                 | `isSensitivePath` runs case-insensitively against the basename _before_ any `stat` or read (so a denial never confirms or denies the file's existence), is not an LLM judgment call, and cannot be bypassed by a traversal sequence since containment is checked first.                                                                                                    |
+| Arbitrary Git arguments, revision ranges, or shell fragments             | Repository tampering, information disclosure, code execution | `GitAdapter` spawns the fixed `git` executable with `shell: false` and a George-built structured argv; `git.diff`'s input is limited to `{ projectId, scope: "working" \| "staged" }` with no pathspec/ref/flag fields. No write/mutating Git subcommand (`add`, `commit`, `push`, `checkout`, `merge`, `reset`, `stash`, branch/tag creation, etc.) is wired to any tool. |
+| Git output (diff/log/branch text) used as instructions                   | Prompt injection via repository content                      | Git output is returned to the caller only as plain structured tool output; it is treated as untrusted data and is never interpolated into a system or security instruction.                                                                                                                                                                                                |
+| Unbounded directory listing, file read, or search                        | Memory/response exhaustion, slow requests                    | All limits are centralized constants (`PROJECT_LIST_MAX`, `DIRECTORY_LIST_MAX`, `FILE_READ_MAX_BYTES`, `SEARCH_MAX_FILES`, `SEARCH_MAX_RESULTS`, `GIT_LOG_MAX`, `GIT_DIFF_MAX_BYTES`, etc.) rather than scattered magic numbers; search also enforces a wall-clock deadline.                                                                                               |
+| `project.open` used as an unapproved desktop action                      | Unapproved code execution                                    | `project.open` is `riskLevel: "HIGH"` and reuses the identical ToolRuntime → PolicyEngine → Approval → Audit pipeline as `apps.open`; it resolves the launch target through `ApplicationRegistry`, never a raw path, and passes only the canonical project root as an argument.                                                                                            |
+| A separate, less-safe UI code path for "Open Project"                    | Security boundary bypass via the UI only                     | The Projects UI's "Abrir proyecto" button calls `POST /api/v1/projects/:id/open`, which registers a continuation in the same `PendingApprovalStore` used by Agent-triggered approvals; there is no direct unauthenticated or unapproved launch path reachable from the UI.                                                                                                 |
+| Removing a project silently deleting the user's files                    | Data loss                                                    | `SettingsStore.removeProject` only edits George's own configuration file; it never touches the filesystem. The Settings UI states this explicitly before the user confirms: "Esto elimina el proyecto de George. Los archivos del equipo no se modificarán."                                                                                                               |
+| Project/Git/filesystem audit leaking file or diff content                | Secret/content disclosure via the audit trail                | Audit records only safe metadata (projectId, toolId, status, risk, policy outcome, approval correlation, duration, typed safe error code); file contents, search snippets, Git diff/log bodies, prompts, and AI responses are never persisted.                                                                                                                             |
+
+No tool in this milestone can create, modify, move, or delete a file, or run a mutating Git command;
+`project.open` is the only capability with a system-level effect and is approval-gated identically to
+`apps.open`. Production has no implicit grant for `projects.open.execute`, `filesystem.read`, or
+`filesystem.search`.

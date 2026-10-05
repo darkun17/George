@@ -20,10 +20,22 @@ import {
 import { DefaultPolicyEngine } from "@george/policy";
 import {
   ApplicationRegistry,
+  GitAdapter,
   InMemoryToolRegistry,
+  ProjectRegistry,
   ToolRuntime,
   createAppsListTool,
   createAppsOpenTool,
+  createFilesystemListTool,
+  createFilesystemReadTool,
+  createFilesystemSearchTool,
+  createGitBranchCurrentTool,
+  createGitDiffTool,
+  createGitLogTool,
+  createGitStatusTool,
+  createProjectInfoTool,
+  createProjectListTool,
+  createProjectOpenTool,
   systemInfoTool,
   systemProcessListTool
 } from "@george/tools-core";
@@ -32,7 +44,13 @@ import { SseAgentEventSink } from "./sse-event-sink.js";
 import { PendingApprovalStore } from "./pending-approval-store.js";
 import { getAuditDatabasePath, SqliteAuditSink } from "./sqlite-audit-sink.js";
 import { getAppDataDir } from "./app-data.js";
-import { SettingsStore, type SettingsPatch } from "./settings-store.js";
+import {
+  ProjectValidationError,
+  SettingsStore,
+  type ProjectInput,
+  type ProjectPatch,
+  type SettingsPatch
+} from "./settings-store.js";
 import { buildDoctorReport } from "./doctor.js";
 
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
@@ -171,11 +189,23 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
       : new SqliteAuditSink(options.auditDatabasePath ?? getAuditDatabasePath(environment)));
   const approvalStore = options.approvalStore ?? new PendingApprovalStore(auditSink);
   const applicationRegistry = new ApplicationRegistry(environment);
+  const projectRegistry = new ProjectRegistry(() => settingsStore.listProjects());
+  const doctorGitAdapter = new GitAdapter();
   const toolRegistry = new InMemoryToolRegistry();
   toolRegistry.register(systemInfoTool);
   toolRegistry.register(createAppsListTool(applicationRegistry));
   toolRegistry.register(createAppsOpenTool(applicationRegistry));
   toolRegistry.register(systemProcessListTool);
+  toolRegistry.register(createProjectListTool(projectRegistry, applicationRegistry));
+  toolRegistry.register(createProjectInfoTool(projectRegistry, applicationRegistry));
+  toolRegistry.register(createProjectOpenTool(projectRegistry, applicationRegistry));
+  toolRegistry.register(createGitStatusTool(projectRegistry));
+  toolRegistry.register(createGitBranchCurrentTool(projectRegistry));
+  toolRegistry.register(createGitLogTool(projectRegistry));
+  toolRegistry.register(createGitDiffTool(projectRegistry));
+  toolRegistry.register(createFilesystemListTool(projectRegistry));
+  toolRegistry.register(createFilesystemReadTool(projectRegistry));
+  toolRegistry.register(createFilesystemSearchTool(projectRegistry));
   const toolRuntime = new ToolRuntime({
     registry: toolRegistry,
     policyEngine: new DefaultPolicyEngine(),
@@ -347,6 +377,356 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
     }
   });
 
+  const projectValidationStatusCode: Record<ProjectValidationError["code"], number> = {
+    PROJECT_ALREADY_EXISTS: 409,
+    PROJECT_NOT_FOUND: 404,
+    PROJECT_ROOT_UNAVAILABLE: 400,
+    PROJECT_CONFIGURATION_INVALID: 400
+  };
+
+  app.get("/api/v1/projects", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    const tool = toolRegistry.get("project.list");
+    if (!tool) {
+      return reply
+        .code(500)
+        .send({ error: { code: "INTERNAL_ERROR", message: "No se pudo listar los proyectos." } });
+    }
+    const result = await tool.handler(
+      {},
+      {
+        executionId: randomUUID(),
+        correlationId: randomUUID(),
+        channel: "desktop",
+        startedAt: new Date().toISOString()
+      }
+    );
+    if (result.status !== "succeeded") {
+      return reply
+        .code(500)
+        .send({ error: { code: "INTERNAL_ERROR", message: "No se pudo listar los proyectos." } });
+    }
+    return result.output;
+  });
+
+  app.get("/api/v1/applications", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    return { applications: applicationRegistry.list() };
+  });
+
+  app.get<{ Params: { id: string } }>("/api/v1/projects/:id", async (request, reply) => {
+    const cookieHeader = request.headers.cookie;
+    if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    reply.header("Cache-Control", "no-store");
+    const infoTool = toolRegistry.get("project.info");
+    const statusTool = toolRegistry.get("git.status");
+    if (!infoTool || !statusTool) {
+      return reply
+        .code(500)
+        .send({ error: { code: "INTERNAL_ERROR", message: "No se pudo leer el proyecto." } });
+    }
+    const context = {
+      executionId: randomUUID(),
+      correlationId: randomUUID(),
+      channel: "desktop" as const,
+      startedAt: new Date().toISOString()
+    };
+    const info = await infoTool.handler({ projectId: request.params.id }, context);
+    if (info.status !== "succeeded") {
+      return reply
+        .code(404)
+        .send({ error: { code: "PROJECT_NOT_FOUND", message: "Proyecto no encontrado." } });
+    }
+    const infoOutput = info.output as { readonly gitRepository: boolean };
+    if (!infoOutput.gitRepository) {
+      return { ...infoOutput };
+    }
+    const status = await statusTool.handler({ projectId: request.params.id }, context);
+    return {
+      ...infoOutput,
+      ...(status.status === "succeeded" ? { gitStatus: status.output } : {})
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/api/v1/projects/:id/open", async (request, reply) => {
+    if (!validateOrigin(request.headers.origin)) {
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+    }
+    const cookieHeader = request.headers.cookie;
+    const session = getSession(
+      Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+    );
+    if (!session) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    const csrfHeader = request.headers["x-george-csrf"];
+    if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
+    }
+    reply.header("Cache-Control", "no-store");
+    const projectId = request.params.id;
+    const requestId = randomUUID();
+    const conversationId = "ui-project-open";
+    const executionId = randomUUID();
+    const toolCallId = randomUUID();
+    const nowIso = (): string => new Date().toISOString();
+    const result = await toolRuntime.execute({
+      executionId,
+      toolCallId,
+      toolId: "project.open",
+      input: { projectId },
+      channel: "desktop",
+      grantedPermissions,
+      deniedPermissions: permissions.deniedPermissions,
+      requestId,
+      conversationId
+    });
+    if (result.status === "completed") {
+      return {
+        status: "completed",
+        requestId,
+        conversationId,
+        content: "",
+        receivedAt: nowIso(),
+        completedAt: nowIso(),
+        durationMs: result.durationMs
+      };
+    }
+    if (result.status === "approval_required" && result.approvalHandle) {
+      const handle = result.approvalHandle;
+      const approval = approvalStore.create(
+        {
+          requestId,
+          conversationId,
+          channel: "desktop",
+          toolCallId,
+          executionId,
+          toolId: "project.open",
+          riskLevel: result.riskLevel ?? "HIGH",
+          ...(result.summary ? { summary: result.summary } : {})
+        },
+        async () => {
+          const approved = await toolRuntime.executeApproved(handle, {
+            grantedPermissions,
+            deniedPermissions: permissions.deniedPermissions
+          });
+          if (approved.status === "completed") {
+            return {
+              status: "completed",
+              requestId,
+              conversationId,
+              content: "",
+              receivedAt: nowIso(),
+              completedAt: nowIso(),
+              durationMs: approved.durationMs
+            };
+          }
+          if (approved.status === "denied" || approved.status === "approval_required") {
+            return {
+              status: "denied",
+              requestId,
+              conversationId,
+              toolId: "project.open",
+              executionId,
+              toolCallId,
+              error: { code: "PERMISSION_DENIED", message: "La acción fue denegada." },
+              receivedAt: nowIso(),
+              completedAt: nowIso(),
+              durationMs: 0
+            };
+          }
+          return {
+            status: "failed",
+            requestId,
+            conversationId,
+            error: { code: "TOOL_EXECUTION_FAILED", message: "La acción no pudo completarse." },
+            receivedAt: nowIso(),
+            completedAt: nowIso(),
+            durationMs: 0
+          };
+        },
+        () => toolRuntime.revokeApproval(handle)
+      );
+      if (!approval) {
+        toolRuntime.revokeApproval(handle);
+        return reply.code(503).send({
+          error: { code: "APPROVAL_UNAVAILABLE", message: "No se pudo crear la aprobación." }
+        });
+      }
+      return reply.code(409).send({
+        status: "approval_required",
+        requestId,
+        conversationId,
+        toolId: "project.open",
+        executionId,
+        toolCallId,
+        approvalId: approval.approvalId,
+        error: { code: "APPROVAL_REQUIRED", message: "Esta acción requiere aprobación." },
+        receivedAt: nowIso(),
+        completedAt: nowIso(),
+        durationMs: 0
+      });
+    }
+    if (result.status === "denied") {
+      return reply.code(403).send({
+        status: "denied",
+        requestId,
+        conversationId,
+        toolId: "project.open",
+        executionId,
+        toolCallId,
+        error: { code: "PERMISSION_DENIED", message: "Policy denied this request." },
+        receivedAt: nowIso(),
+        completedAt: nowIso(),
+        durationMs: 0
+      });
+    }
+    return reply.code(500).send({
+      status: "failed",
+      requestId,
+      conversationId,
+      error: { code: "TOOL_EXECUTION_FAILED", message: "No se pudo abrir el proyecto." },
+      receivedAt: nowIso(),
+      completedAt: nowIso(),
+      durationMs: 0
+    });
+  });
+
+  app.post<{ Body: unknown }>("/api/v1/settings/projects", async (request, reply) => {
+    if (!validateOrigin(request.headers.origin)) {
+      return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+    }
+    const cookieHeader = request.headers.cookie;
+    const session = getSession(
+      Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+    );
+    if (!session) {
+      return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+    }
+    const csrfHeader = request.headers["x-george-csrf"];
+    if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+      return rejectRequest(
+        request,
+        reply,
+        403,
+        "CSRF_REJECTED",
+        "La solicitud no superó la validación CSRF."
+      );
+    }
+    reply.header("Cache-Control", "no-store");
+    try {
+      return settingsStore.addProject((request.body ?? {}) as ProjectInput);
+    } catch (error) {
+      if (error instanceof ProjectValidationError) {
+        return reply
+          .code(projectValidationStatusCode[error.code])
+          .send({ error: { code: error.code, message: error.message } });
+      }
+      return reply.code(400).send({
+        error: {
+          code: "PROJECT_CONFIGURATION_INVALID",
+          message: "La configuración del proyecto no es válida."
+        }
+      });
+    }
+  });
+
+  app.patch<{ Params: { id: string }; Body: unknown }>(
+    "/api/v1/settings/projects/:id",
+    async (request, reply) => {
+      if (!validateOrigin(request.headers.origin)) {
+        return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+      }
+      const cookieHeader = request.headers.cookie;
+      const session = getSession(
+        Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+      );
+      if (!session) {
+        return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+      }
+      const csrfHeader = request.headers["x-george-csrf"];
+      if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+        return rejectRequest(
+          request,
+          reply,
+          403,
+          "CSRF_REJECTED",
+          "La solicitud no superó la validación CSRF."
+        );
+      }
+      reply.header("Cache-Control", "no-store");
+      try {
+        return settingsStore.updateProject(request.params.id, (request.body ?? {}) as ProjectPatch);
+      } catch (error) {
+        if (error instanceof ProjectValidationError) {
+          return reply
+            .code(projectValidationStatusCode[error.code])
+            .send({ error: { code: error.code, message: error.message } });
+        }
+        return reply.code(400).send({
+          error: {
+            code: "PROJECT_CONFIGURATION_INVALID",
+            message: "La configuración del proyecto no es válida."
+          }
+        });
+      }
+    }
+  );
+
+  app.delete<{ Params: { id: string } }>(
+    "/api/v1/settings/projects/:id",
+    async (request, reply) => {
+      if (!validateOrigin(request.headers.origin)) {
+        return rejectRequest(request, reply, 403, "ORIGIN_REJECTED", "Origen no permitido.");
+      }
+      const cookieHeader = request.headers.cookie;
+      const session = getSession(
+        Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader
+      );
+      if (!session) {
+        return rejectRequest(request, reply, 401, "SESSION_REQUIRED", "Inicia una sesión local.");
+      }
+      const csrfHeader = request.headers["x-george-csrf"];
+      if (!sessions.validateCsrf(session, Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader)) {
+        return rejectRequest(
+          request,
+          reply,
+          403,
+          "CSRF_REJECTED",
+          "La solicitud no superó la validación CSRF."
+        );
+      }
+      reply.header("Cache-Control", "no-store");
+      try {
+        settingsStore.removeProject(request.params.id);
+        return { removed: request.params.id };
+      } catch (error) {
+        if (error instanceof ProjectValidationError) {
+          return reply
+            .code(projectValidationStatusCode[error.code])
+            .send({ error: { code: error.code, message: error.message } });
+        }
+        throw error;
+      }
+    }
+  );
+
   app.get("/api/v1/doctor", async (request, reply) => {
     const cookieHeader = request.headers.cookie;
     if (!getSession(Array.isArray(cookieHeader) ? cookieHeader.join("; ") : cookieHeader)) {
@@ -369,7 +749,29 @@ export async function buildHostServer(options: HostServerOptions = {}): Promise<
       },
       trustedOriginCount: () => origins.size,
       appVersion: "0.1.0",
-      dataDirectory: getAppDataDir(environment)
+      dataDirectory: getAppDataDir(environment),
+      gitAvailable: () => doctorGitAdapter.version(),
+      projectStatuses: async () =>
+        Promise.all(
+          projectRegistry.list().map(async (project) => {
+            const rootStatus = projectRegistry.resolveRoot(project.id);
+            const gitRepository =
+              rootStatus.available &&
+              (await doctorGitAdapter.isRepository(rootStatus.canonicalRoot));
+            return {
+              id: project.id,
+              displayName: project.displayName,
+              rootAvailable: rootStatus.available,
+              gitRepository,
+              ...(project.defaultApplicationId
+                ? {
+                    defaultApplicationAvailable:
+                      applicationRegistry.resolve(project.defaultApplicationId) !== undefined
+                  }
+                : {})
+            };
+          })
+        )
     });
   });
 

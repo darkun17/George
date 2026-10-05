@@ -161,7 +161,11 @@ Fastify 5 provides the typed server, Pino logger, and `inject`-based integration
 include `GET /api/v1/health`, session-authenticated `GET /api/v1/ai/status`,
 `GET /api/v1/ai/models`, `GET /api/v1/tools`, `POST /api/v1/tools/:id/execute`,
 `POST /api/v1/session/bootstrap`,
-`POST /api/v1/agent/requests`, and `GET /api/v1/agent/events`. Request bodies are capped at 16 KiB;
+`POST /api/v1/agent/requests`, `GET /api/v1/agent/events`, `GET /api/v1/applications`,
+`GET /api/v1/projects`, `GET /api/v1/projects/:id`, `POST /api/v1/projects/:id/open`,
+`POST /api/v1/settings/projects`, `PATCH /api/v1/settings/projects/:id`, and
+`DELETE /api/v1/settings/projects/:id` (see "Projects, read-only Git, and scoped filesystem access"
+below). Request bodies are capped at 16 KiB;
 agent text is capped at 4,000 characters. Connection/request timeouts and header-size limits are
 configured at the server boundary. Error responses omit internal causes and stacks.
 
@@ -285,6 +289,70 @@ locations checked with `existsSync`, never a recursive or drive-wide search. `ap
 a registered `applicationId`, is `riskLevel: "HIGH"`, and spawns with `shell: false` and no arguments;
 `apps.list` and `system.process.list` are read-only. All three are ordinary `ToolDefinition`s running
 through the same `ToolRuntime` → `PolicyEngine` → Approval → Audit pipeline as `system.info`.
+
+## Projects, read-only Git, and scoped filesystem access (M5.2)
+
+`ProjectRegistry` (`packages/tools-core/src/project-registry.ts`) is the only place a trusted
+`projectId` resolves to a filesystem root. Projects are configuration-only references, validated by
+`@george/config`'s `projectDefinitionSchema` and persisted by the same `SettingsStore` used for
+Settings (no second config system); removing a project from George's configuration never touches the
+referenced folder. `ProjectRegistry` is constructed with a live getter
+(`() => settingsStore.listProjects()`), so edits made through Settings apply immediately without a
+Host restart, and `resolveRoot(projectId)` re-canonicalizes and re-`stat`s the root on every call
+rather than caching a result from registration time -- a root that is deleted, unmounted, or replaced
+with a symlink after a project was added is caught at the moment a tool actually tries to use it, not
+only when the project was first configured.
+
+Path containment (`packages/tools-core/src/project-path.ts`) never relies on `target.startsWith(root)`
+alone, which would wrongly authorize a sibling directory that merely shares a name prefix (e.g. a
+trusted root `C:\Projects\foo` must not authorize `C:\Projects\foobar`). `resolveProjectPath` rejects
+any `..` segment, rejects absolute/drive/UNC paths outright, then resolves the candidate path and
+requires `resolved === root || resolved.startsWith(root + sep)`. A second function,
+`assertRealPathContained`, re-resolves both the root and the final path with `realpathSync.native`
+immediately before a sensitive read, so a symlink or junction created after the lexical check passed
+cannot redirect a read outside the project root (TOCTOU-aware by construction, not by convention).
+
+Git access (`packages/tools-core/src/git-adapter.ts`) spawns the fixed `git` executable with
+`shell: false`, a structured argument array George builds internally, a bounded output buffer, and a
+timeout; it never accepts raw arguments, refs, or shell fragments from a tool caller. The exposed tools
+-- `git.status`, `git.branch.current`, `git.log` (bounded, capped `limit`), and `git.diff` (narrow
+`scope: "working" | "staged"` input only, no pathspec/revision-range) -- are strictly read-only; add,
+commit, push, pull, checkout, merge, reset, stash, and branch/tag mutation are intentionally absent
+from the tool surface, not merely undocumented. Git output (diffs, log messages, branch names) is
+untrusted data: it is returned to the caller as plain tool output and is never interpolated into a
+system/security instruction.
+
+Filesystem tools (`packages/tools-core/src/filesystem-tools.ts`) -- `filesystem.list`,
+`filesystem.read`, `filesystem.search` -- accept only `{ projectId, relativePath? }`, never an absolute
+path or a raw `cwd`. Each sensitive operation resolves the root, resolves and re-validates the path,
+checks the sensitive-file deny-list (`packages/tools-core/src/sensitive-files.ts` -- `.env*`, `*.pem`,
+`*.key`, `*.pfx`, `*.p12`, `id_rsa`/`id_ed25519`, `credentials*`, `secrets*`, `.npmrc`, `.netrc`,
+`known_hosts`, `authorized_keys`, case-insensitive) _before_ any `stat`/read so a denial never leaks
+whether the file exists, then re-checks real-path containment, then enforces a size cap and a
+null-byte-based binary-file rejection. `filesystem.search` walks the tree breadth-first, skips common
+noise directories, and is bounded by files-scanned, results-returned, and wall-clock deadline
+constants. All list/read/search/log/diff limits are centralized in
+`packages/tools-core/src/output-limits.ts` rather than scattered as magic numbers.
+
+`project.open` is the one non-read-only tool in this surface: it resolves `projectId` → canonical root
+through `ProjectRegistry`, resolves an `applicationId` (explicit, or the project's configured default)
+through the same `ApplicationRegistry` `apps.open` uses, and launches that application with the
+canonical root as its only argument -- it does not duplicate `apps.open`'s launch logic, and it is
+`riskLevel: "HIGH"` and approval-gated through the identical `ToolRuntime` → `PolicyEngine` → Approval
+→ Audit pipeline. The Host exposes `GET /api/v1/projects`, `GET /api/v1/projects/:id` (merging
+`project.info` and, when the project is a Git repository, `git.status`), and
+`POST /api/v1/projects/:id/open`, the last of which registers an `approvalStore` continuation so the
+Projects UI's "Abrir proyecto" button resolves through the exact same pending-approval list and
+`/api/v1/approvals/:id/approve|deny` routes as an Agent-triggered approval -- there is no separate,
+unauthenticated UI code path for opening a project. `POST /api/v1/settings/projects`,
+`PATCH /api/v1/settings/projects/:id`, and `DELETE /api/v1/settings/projects/:id` manage the
+configuration itself (Origin + session + CSRF gated, same as other Settings mutations); removal only
+ever edits George's configuration file.
+
+Audit for this surface records only safe metadata (projectId, toolId, status, risk, policy outcome,
+approval correlation, duration, and a typed safe error code such as `PATH_OUTSIDE_PROJECT` or
+`SENSITIVE_FILE_DENIED`) -- file contents, search snippets, Git diff/log bodies, prompts, and AI
+responses are never persisted.
 
 ## Platform and package rules
 

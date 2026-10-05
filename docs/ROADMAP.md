@@ -15,7 +15,7 @@ Milestones are proposed; each needs a focused scope and acceptance criteria befo
 | M5.0.1 Dev transport hotfixes             | Dev-mode session/CSRF collision fix, chat layout fix                                                     | Done    |
 | M5.0.2 Settings + George Doctor           | Settings UI/API, persisted assistant profile, real diagnostics                                           | Done    |
 | M5.1 First Desktop Actions                | ApplicationRegistry, apps.list/apps.open, read-only process listing, approval-gated                      | Done    |
-| M5.2 Projects + Git + Safe Files          | Project registry, read-only Git tools, scoped read-only filesystem tools                                 | Planned |
+| M5.2 Projects + Git + Safe Files          | Project registry, read-only Git tools, scoped read-only filesystem tools                                 | Done    |
 | M6 Profile + Memory                       | Local memory model, retention and user controls                                                          | Planned |
 | M7 Voice Foundation                       | Push-to-talk voice channel, local STT/TTS                                                                | Planned |
 | M7.1 Activation                           | Global hotkey, later wake word                                                                           | Planned |
@@ -39,7 +39,16 @@ real Settings UI/API backed by a persisted assistant profile (outside the reposi
 a George Doctor that performs real, non-hardcoded checks. M5.1 gave George its first controlled
 desktop actions (`apps.list`, `apps.open`, `system.process.list`) through a trusted
 `ApplicationRegistry` the model can only reference by ID, with `apps.open` requiring explicit human
-approval. Voice stays after these boundaries so it cannot bypass them. Vision follows explicit capture
-and consent design. Automation follows reliable approval and audit.
+approval. M5.2 gave George a trusted `ProjectRegistry` (projects are configuration-only references to
+an existing folder, never files George creates, moves, or deletes) plus a strictly read-only tool
+surface built on it: `project.list`/`project.info` (safe metadata), `project.open` (approval-gated,
+reusing `ApplicationRegistry` the same way `apps.open` does), read-only Git (`git.status`,
+`git.branch.current`, `git.log`, `git.diff`, via direct `spawn` with a fixed executable and structured
+argv -- never a shell), and project-scoped filesystem tools (`filesystem.list`, `filesystem.read`,
+`filesystem.search`) that accept only a trusted `projectId` + `relativePath`, never an absolute path or
+raw `cwd`. Path containment resolves and canonicalizes rather than trusting a string prefix, sensitive
+files (`.env`, keys, credentials) are denied before any read, and all list/read/search/log/diff outputs
+are bounded by centralized limits. Voice stays after these boundaries so it cannot bypass them. Vision
+follows explicit capture and consent design. Automation follows reliable approval and audit.
 
 M3 adds the independent @george/ai boundary with deterministic mock and local Ollama providers, validated selection, model discovery, and separate AI health. An optional Anthropic adapter is a later M3.1 candidate; M3 includes no cloud provider.

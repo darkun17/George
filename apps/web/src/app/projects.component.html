@@ -1,0 +1,94 @@
+<div class="projects-panel" aria-label="Proyectos">
+  <header class="settings-header">
+    <p class="eyebrow">PROYECTOS</p>
+    <h1>Proyectos de George</h1>
+  </header>
+
+  @if (statusMessage()) {
+    <p class="settings-status" role="status">{{ statusMessage() }}</p>
+  }
+
+  @if (projects().length === 0) {
+    <p class="settings-hint">
+      No hay proyectos configurados. Agrega uno desde Ajustes → Proyectos.
+    </p>
+  } @else {
+    <div class="projects-layout">
+      <nav class="projects-list" aria-label="Lista de proyectos">
+        @for (project of projects(); track project.projectId) {
+          <button
+            type="button"
+            class="projects-list-item"
+            [class.active]="selectedProjectId() === project.projectId"
+            (click)="selectProject(project.projectId)"
+          >
+            <strong>{{ project.displayName }}</strong>
+            <small>{{ project.projectId }}</small>
+          </button>
+        }
+      </nav>
+
+      <section class="projects-detail" aria-label="Detalle del proyecto">
+        @if (loadingDetail()) {
+          <p class="settings-hint">Cargando…</p>
+        } @else if (selectedProject()) {
+          <div>
+            <h2>{{ selectedProject()!.displayName }}</h2>
+            @if (selectedProject()!.description) {
+              <p>{{ selectedProject()!.description }}</p>
+            }
+
+            <div class="doctor-row">
+              <span>Carpeta</span>
+              <span
+                class="doctor-state"
+                [class.doctor-state-ok]="selectedProject()!.rootAvailable"
+                [class.doctor-state-warn]="!selectedProject()!.rootAvailable"
+                >{{ selectedProject()!.rootAvailable ? "Disponible" : "No disponible" }}</span
+              >
+            </div>
+            <div class="doctor-row">
+              <span>Repositorio Git</span>
+              <span class="doctor-state">{{ selectedProject()!.gitRepository ? "Sí" : "No" }}</span>
+            </div>
+            @if (selectedProject()!.gitRepository) {
+              <div class="doctor-row">
+                <span>Rama actual</span>
+                <span class="doctor-state">{{
+                  selectedProject()!.branch ??
+                    (selectedProject()!.detached ? "(desconectada)" : "—")
+                }}</span>
+              </div>
+              @if (toGitStatusView(selectedProject()!.gitStatus); as gitStatus) {
+                <div class="doctor-row">
+                  <span>Árbol de trabajo</span>
+                  <span class="doctor-state">
+                    {{ gitStatus.modifiedCount ?? 0 }} modificados ·
+                    {{ gitStatus.stagedCount ?? 0 }} preparados ·
+                    {{ gitStatus.untrackedCount ?? 0 }} sin seguimiento
+                  </span>
+                </div>
+              }
+            }
+
+            <div class="project-row-actions">
+              <button type="button" class="settings-secondary-button" (click)="refresh()">
+                Actualizar
+              </button>
+              <button
+                type="button"
+                class="settings-save-button"
+                [disabled]="opening() || !selectedProject()!.rootAvailable"
+                (click)="openProject()"
+              >
+                {{ opening() ? "Abriendo…" : "Abrir proyecto" }}
+              </button>
+            </div>
+          </div>
+        } @else {
+          <p class="settings-hint">Selecciona un proyecto.</p>
+        }
+      </section>
+    </div>
+  }
+</div>
